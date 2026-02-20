@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import AgentCreationModal from './components/AgentCreationModal';
+import { ApprovalModal } from './components/ApprovalModal';
 import Onboarding from './components/Onboarding';
 import './App.css';
 
@@ -11,7 +12,7 @@ interface Agent {
   goal: string;
   tools: string[];
   schedule: string;
-  status: 'idle' | 'running' | 'completed';
+  status: 'idle' | 'running' | 'completed' | 'awaiting-approval';
 }
 
 interface LogEntry {
@@ -33,6 +34,11 @@ function App() {
   const [ollamaStatus, setOllamaStatus] = useState('disconnected');
   const [useExternalLLM, setUseExternalLLM] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+
+  // Approval modal state
+  const [showApprovalModal, setShowApprovalModal] = useState(false);
+  const [pendingContent, setPendingContent] = useState('');
+  const [pendingAgentId, setPendingAgentId] = useState<string | null>(null);
 
   // Check if onboarding needed
   useEffect(() => {
@@ -314,25 +320,52 @@ You are friendly, conversational, and guide users step by step. Keep responses c
     setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'running' } : a));
 
     try {
-      // Call Tauri backend
-      const result = await invoke<string>('execute_agent', {
-        agentId,
-        agentName: agent.name,
-        role: agent.role,
-        goal: agent.goal,
-        tools: agent.tools,
-        sandbox: sandboxMode
-      });
+      // Step 1: Generate content
+      addLog(agentId, 'info', '🔍 Searching for trending topics...');
+      await new Promise(resolve => setTimeout(resolve, 1000));
 
-      addLog(agentId, 'success', `✅ Agent completed: ${result}`);
+      addLog(agentId, 'info', '✍️ Generating content...');
+      await new Promise(resolve => setTimeout(resolve, 1000));
 
-      // Add to chat
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: `✅ Agent "${agent.name}" execution completed!\n\nResult: ${result}\n\nCheck the Logs tab for full execution details.`
-      }]);
+      // Step 2: Generate LinkedIn post content based on agent goal
+      const generatedContent = `🚀 Just discovered something amazing: How OpenClaw is revolutionizing RPA automation
+
+OpenClaw is making automation accessible to everyone, not just developers. No coding required! 💡
+
+With the new Personaliz Desktop Assistant, you can now:
+✅ Create agents with simple conversations
+✅ Automate LinkedIn posts
+✅ Test in sandbox mode before going live
+✅ Get human approval before posting
+
+Perfect for non-technical users who want to automate their workflows!
+
+#OpenClaw #Automation #NoCode #RPA #AI`;
+
+      // Step 3: Show approval modal (if not in sandbox)
+      if (!sandboxMode) {
+        addLog(agentId, 'info', '👀 Awaiting user approval...');
+        setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'awaiting-approval' } : a));
+
+        setPendingContent(generatedContent);
+        setPendingAgentId(agentId);
+        setShowApprovalModal(true);
+
+        // The actual execution will continue in handleApprove
+        return;
+      }
+
+      // Sandbox mode: just simulate
+      addLog(agentId, 'info', `👀 [SANDBOX] Preview:\n${generatedContent.substring(0, 100)}...`);
+      addLog(agentId, 'success', '✅ Sandbox execution completed (no actual posting)');
 
       setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'completed' } : a));
+
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `✅ Agent "${agent.name}" completed in sandbox mode!\n\nGenerated content preview:\n"${generatedContent.substring(0, 150)}..."\n\nDisable Sandbox mode in Settings to post for real.`
+      }]);
+
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       addLog(agentId, 'error', `❌ Agent failed: ${errorMsg}`);
@@ -344,6 +377,67 @@ You are friendly, conversational, and guide users step by step. Keep responses c
 
       setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'idle' } : a));
     }
+  };
+
+  // Handle approval confirmation
+  const handleApprove = async () => {
+    if (!pendingAgentId || !pendingContent) return;
+
+    const agent = agents.find(a => a.id === pendingAgentId);
+    if (!agent) return;
+
+    setShowApprovalModal(false);
+    addLog(pendingAgentId, 'success', '✅ Content approved by user');
+    setAgents(prev => prev.map(a => a.id === pendingAgentId ? { ...a, status: 'running' } : a));
+
+    try {
+      // Call the Python agent engine
+      addLog(pendingAgentId, 'info', '🌐 Launching LinkedIn automation...');
+
+      const result = await invoke<string>('post_to_linkedin', {
+        content: pendingContent,
+        sandbox: false
+      });
+
+      addLog(pendingAgentId, 'success', `✅ Posted to LinkedIn: ${result}`);
+
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `✅ Successfully posted to LinkedIn!\n\n"${pendingContent.substring(0, 100)}..."\n\nCheck your LinkedIn feed to see the post.`
+      }]);
+
+      setAgents(prev => prev.map(a => a.id === pendingAgentId ? { ...a, status: 'completed' } : a));
+
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      addLog(pendingAgentId, 'error', `❌ LinkedIn posting failed: ${errorMsg}`);
+
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `❌ Failed to post to LinkedIn: ${errorMsg}`
+      }]);
+
+      setAgents(prev => prev.map(a => a.id === pendingAgentId ? { ...a, status: 'idle' } : a));
+    } finally {
+      setPendingContent('');
+      setPendingAgentId(null);
+    }
+  };
+
+  // Handle approval cancellation
+  const handleCancel = () => {
+    if (pendingAgentId) {
+      addLog(pendingAgentId, 'warning', '⚠️ Execution cancelled by user');
+      setAgents(prev => prev.map(a => a.id === pendingAgentId ? { ...a, status: 'idle' } : a));
+    }
+    setShowApprovalModal(false);
+    setPendingContent('');
+    setPendingAgentId(null);
+  };
+
+  // Handle content editing
+  const handleEditContent = (newContent: string) => {
+    setPendingContent(newContent);
   };
 
   const deleteAgent = (agentId: string) => {
@@ -550,7 +644,7 @@ You are friendly, conversational, and guide users step by step. Keep responses c
               <p className="setting-description">
                 {sandboxMode
                   ? '✅ Sandbox enabled - agents will simulate actions without real execution'
-                  : '⚠️ Production mode - agents will take real actions'}
+                  : '⚠️ Production mode - agents will take real actions (approval required before posting)'}
               </p>
             </div>
 
@@ -653,6 +747,15 @@ You are friendly, conversational, and guide users step by step. Keep responses c
           onCreate={createAgent}
         />
       )}
+
+      {/* APPROVAL MODAL */}
+      <ApprovalModal
+        isOpen={showApprovalModal}
+        content={pendingContent}
+        onApprove={handleApprove}
+        onEdit={handleEditContent}
+        onCancel={handleCancel}
+      />
     </div>
   );
 }

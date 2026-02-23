@@ -1,7 +1,19 @@
-# Tauri + React + Typescript
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
 
-## Recommended IDE Setup
+**A desktop automation assistant powered by local AI (Llama3) + Tauri**
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## ✅ Completed Features
+- ✅ Desktop app with Tauri
+- ✅ Local LLM (Llama3 via Ollama)
+- ✅ External API support (GPT-4, Claude)
+- ✅ Agent creation & management
+- ✅ Approval workflow
+- ✅ Sandbox mode
+- ✅ Browser automation (Playwright)
+- ✅ Activity logging
+
+## 🚧 In Progress
+- ⚙️ Background job scheduler
+- ⚙️ OpenClaw CLI integration
+- ⚙️ Event handlers
+

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import AgentCreationModal from './components/AgentCreationModal';
 import { ApprovalModal } from './components/ApprovalModal';
@@ -47,6 +47,31 @@ interface RunHistoryEntry {
   result?: string;
 }
 
+interface HeartbeatRow {
+  id: string;
+  agent_id: string;
+  interval_min: number;
+  enabled: boolean;
+  last_check: string | null;
+  created_at: string;
+}
+
+interface HeartbeatRunRow {
+  id: number;
+  agent_id: string;
+  checked_at: string;
+  status: string;
+  message: string | null;
+}
+
+interface LlmUsageRow {
+  id: number;
+  provider: string;
+  model: string;
+  context: string;
+  timestamp: string;
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
@@ -64,7 +89,13 @@ function App() {
   const [ollamaStatus, setOllamaStatus] = useState('disconnected');
   const [useExternalLLM, setUseExternalLLM] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [localModel, setLocalModel] = useState('phi3');
+  const [localModel, setLocalModel] = useState('llama3');
+  const [heartbeats, setHeartbeats] = useState<HeartbeatRow[]>([]);
+  const [heartbeatRuns, setHeartbeatRuns] = useState<HeartbeatRunRow[]>([]);
+  const [llmUsage, setLlmUsage] = useState<LlmUsageRow[]>([]);
+
+  // Floating assistant icon state
+  const [isChatOpen, setIsChatOpen] = useState(true);
 
   // Approval modal
   const [showApprovalModal, setShowApprovalModal] = useState(false);
@@ -84,7 +115,7 @@ function App() {
     } else {
       checkOllamaConnection();
       checkExternalLLM();
-      setLocalModel(localStorage.getItem('local_model') || 'phi3');
+      setLocalModel(localStorage.getItem('local_model') || 'llama3');
       loadPersistedData();
     }
   }, []);
@@ -139,6 +170,21 @@ function App() {
         result: r.result,
       }));
       setRunHistory(mapped);
+    } catch (_) {}
+
+    try {
+      const hbs = await invoke<HeartbeatRow[]>('db_list_heartbeats');
+      setHeartbeats(hbs);
+    } catch (_) {}
+
+    try {
+      const hbRuns = await invoke<HeartbeatRunRow[]>('db_get_heartbeat_runs', { limit: 50 });
+      setHeartbeatRuns(hbRuns);
+    } catch (_) {}
+
+    try {
+      const usage = await invoke<LlmUsageRow[]>('db_get_llm_usage', { limit: 50 });
+      setLlmUsage(usage);
     } catch (_) {}
   };
 
@@ -196,21 +242,22 @@ function App() {
   };
 
   const callLocalLLM = async (message: string): Promise<string> => {
-    const model = localStorage.getItem('local_model') || 'phi3';
+    const model = localStorage.getItem('local_model') || 'llama3';
     const systemPrompt = `You are Personaliz, a helpful desktop assistant that helps users automate tasks with OpenClaw.
 You are friendly, conversational, and guide users step by step.
 Keep responses concise (2-3 sentences max).`;
 
     try {
-      // Try Tauri command first (passes model name)
+      // Try Tauri command first (passes model name, logs usage to SQLite)
       const reply = await invoke<string>('send_message_to_llm', {
         message,
         history: messages.map(m => ({ role: m.role, content: m.content })),
         model,
+        context: 'chat',
       });
       return reply;
     } catch (_) {
-      // Fallback to direct HTTP
+      // Fallback to direct HTTP (dev mode without Tauri)
     }
 
     const response = await fetch('http://localhost:11434/api/chat', {
@@ -234,6 +281,22 @@ Keep responses concise (2-3 sentences max).`;
   };
 
   const callExternalLLM = async (message: string, apiKey: string, model: string): Promise<string> => {
+    try {
+      // Route through Tauri backend which logs usage to SQLite
+      const reply = await invoke<string>('send_message_to_external_llm', {
+        req: {
+          message,
+          history: messages.map(m => ({ role: m.role, content: m.content })),
+          api_key: apiKey,
+          model,
+          context: 'chat',
+        },
+      });
+      return reply;
+    } catch (_) {
+      // Fallback to direct HTTP if Tauri is not available (dev mode)
+    }
+
     const systemPrompt = `You are Personaliz, a helpful desktop assistant for OpenClaw automation. Keep responses concise.`;
     if (model.includes('claude')) {
       const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -295,9 +358,11 @@ Keep responses concise (2-3 sentences max).`;
       if (externalKey?.trim()) {
         response = await callExternalLLM(userMessage, externalKey, llmModel);
         setUseExternalLLM(true);
+        addLog('chat', 'info', `LLM: external (${llmModel})`);
       } else {
         response = await callLocalLLM(userMessage);
         setUseExternalLLM(false);
+        addLog('chat', 'info', `LLM: local Ollama (${localStorage.getItem('local_model') || 'llama3'})`);
       }
 
       setMessages(prev => [...prev, { role: 'assistant', content: response }]);
@@ -554,6 +619,53 @@ Keep responses concise (2-3 sentences max).`;
   };
 
   // -------------------------------------------------------------------------
+  // Heartbeats
+  // -------------------------------------------------------------------------
+
+  const enableHeartbeat = async (agentId: string, intervalMin: number = 60) => {
+    try {
+      const id = await invoke<string>('db_upsert_heartbeat', {
+        agentId,
+        intervalMin,
+        enabled: true,
+      });
+      const newHb: HeartbeatRow = {
+        id,
+        agent_id: agentId,
+        interval_min: intervalMin,
+        enabled: true,
+        last_check: null,
+        created_at: new Date().toISOString(),
+      };
+      setHeartbeats(prev => [...prev.filter(h => h.agent_id !== agentId), newHb]);
+      const agent = agents.find(a => a.id === agentId);
+      addLog(agentId, 'success', `💓 Heartbeat enabled for "${agent?.name}" every ${intervalMin} min`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog(agentId, 'error', `❌ Failed to enable heartbeat: ${msg}`);
+    }
+  };
+
+  const disableHeartbeat = async (heartbeatId: string, agentId: string) => {
+    try {
+      await invoke('db_delete_heartbeat', { id: heartbeatId });
+      setHeartbeats(prev => prev.filter(h => h.id !== heartbeatId));
+      const agent = agents.find(a => a.id === agentId);
+      addLog(agentId, 'info', `💔 Heartbeat disabled for "${agent?.name}"`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog(agentId, 'error', `❌ Failed to disable heartbeat: ${msg}`);
+    }
+  };
+
+  const refreshHeartbeatRuns = async () => {
+    try {
+      const runs = await invoke<HeartbeatRunRow[]>('db_get_heartbeat_runs', { limit: 50 });
+      setHeartbeatRuns(runs);
+    } catch (_) {}
+  };
+
+  // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
 
@@ -585,7 +697,7 @@ Perfect for non-technical users who want to automate their workflows!
         setIsOnboarding(false);
         checkOllamaConnection();
         checkExternalLLM();
-        setLocalModel(localStorage.getItem('local_model') || 'phi3');
+        setLocalModel(localStorage.getItem('local_model') || 'llama3');
         loadPersistedData();
       }} />
     );
@@ -712,33 +824,64 @@ Perfect for non-technical users who want to automate their workflows!
               </div>
             ) : (
               <div className="agents-grid">
-                {agents.map(agent => (
-                  <div key={agent.id} className="agent-card">
-                    <div className="agent-header">
-                      <h3>{agent.name}</h3>
-                      <span className={`status-badge ${agent.status}`}>{agent.status}</span>
+                {agents.map(agent => {
+                  const agentHeartbeat = heartbeats.find(h => h.agent_id === agent.id);
+                  return (
+                    <div key={agent.id} className="agent-card">
+                      <div className="agent-header">
+                        <h3>{agent.name}</h3>
+                        <span className={`status-badge ${agent.status}`}>{agent.status}</span>
+                      </div>
+                      <div className="agent-details">
+                        <p><strong>Role:</strong> {agent.role}</p>
+                        <p><strong>Goal:</strong> {agent.goal}</p>
+                        <p><strong>Tools:</strong> {agent.tools.join(', ') || 'None'}</p>
+                        <p><strong>Schedule:</strong> {agent.schedule}</p>
+                        {agent.agentType && agent.agentType !== 'custom' && (
+                          <p><strong>Type:</strong> {agent.agentType === 'trending' ? '📈 Trending Poster' : '💬 Hashtag Commenter'}</p>
+                        )}
+                        <p>
+                          <strong>Heartbeat:</strong>{' '}
+                          {agentHeartbeat ? (
+                            <span style={{ color: 'var(--success)' }}>
+                              💓 Every {agentHeartbeat.interval_min} min
+                              {agentHeartbeat.last_check && ` (last: ${agentHeartbeat.last_check.slice(0, 16).replace('T', ' ')})`}
+                            </span>
+                          ) : (
+                            <span style={{ color: 'var(--text-secondary)' }}>Off</span>
+                          )}
+                        </p>
+                      </div>
+                      <div className="agent-actions">
+                        <button
+                          className="run-btn"
+                          onClick={() => runAgent(agent.id)}
+                          disabled={agent.status === 'running'}
+                        >
+                          {agent.status === 'running' ? '⏳ Running…' : '▶️ Run Agent'}
+                        </button>
+                        {agentHeartbeat ? (
+                          <button
+                            className="check-btn"
+                            title="Disable heartbeat monitoring"
+                            onClick={() => disableHeartbeat(agentHeartbeat.id, agent.id)}
+                          >
+                            💔 Heartbeat
+                          </button>
+                        ) : (
+                          <button
+                            className="check-btn"
+                            title="Enable heartbeat monitoring (every 60 min)"
+                            onClick={() => enableHeartbeat(agent.id, 60)}
+                          >
+                            💓 Heartbeat
+                          </button>
+                        )}
+                        <button className="delete-btn" onClick={() => deleteAgent(agent.id)}>🗑️</button>
+                      </div>
                     </div>
-                    <div className="agent-details">
-                      <p><strong>Role:</strong> {agent.role}</p>
-                      <p><strong>Goal:</strong> {agent.goal}</p>
-                      <p><strong>Tools:</strong> {agent.tools.join(', ') || 'None'}</p>
-                      <p><strong>Schedule:</strong> {agent.schedule}</p>
-                      {agent.agentType && agent.agentType !== 'custom' && (
-                        <p><strong>Type:</strong> {agent.agentType === 'trending' ? '📈 Trending Poster' : '💬 Hashtag Commenter'}</p>
-                      )}
-                    </div>
-                    <div className="agent-actions">
-                      <button
-                        className="run-btn"
-                        onClick={() => runAgent(agent.id)}
-                        disabled={agent.status === 'running'}
-                      >
-                        {agent.status === 'running' ? '⏳ Running…' : '▶️ Run Agent'}
-                      </button>
-                      <button className="delete-btn" onClick={() => deleteAgent(agent.id)}>🗑️</button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
@@ -757,6 +900,29 @@ Perfect for non-technical users who want to automate their workflows!
                 </div>
               </div>
             )}
+
+            {/* Heartbeat Monitor */}
+            <div style={{ marginTop: '32px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
+                <h3>💓 Heartbeat Monitor</h3>
+                <button className="check-btn" onClick={refreshHeartbeatRuns}>🔄 Refresh</button>
+              </div>
+              {heartbeatRuns.length === 0 ? (
+                <p style={{ color: 'var(--text-secondary)', fontSize: '13px' }}>
+                  No heartbeat checks recorded yet. Enable heartbeats on agents above to start monitoring.
+                </p>
+              ) : (
+                <div className="logs-list">
+                  {heartbeatRuns.slice(0, 30).map(r => (
+                    <div key={r.id} className={`log-entry ${r.status === 'ok' ? 'success' : r.status === 'idle' ? 'info' : 'error'}`}>
+                      <span className="log-time">{r.checked_at.slice(0, 19).replace('T', ' ')}</span>
+                      <span className={`log-level ${r.status === 'ok' ? 'success' : 'info'}`}>[{r.status.toUpperCase()}]</span>
+                      <span className="log-message">Agent {r.agent_id.slice(-8)} – {r.message || 'No message'}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -775,6 +941,25 @@ Perfect for non-technical users who want to automate their workflows!
                     <span className="log-message">{log.message}</span>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {/* LLM Usage Log */}
+            {llmUsage.length > 0 && (
+              <div style={{ marginTop: '32px' }}>
+                <h3 style={{ marginBottom: '12px' }}>🤖 LLM Usage Log</h3>
+                <div className="logs-list">
+                  {llmUsage.slice(0, 20).map(u => (
+                    <div key={u.id} className="log-entry info">
+                      <span className="log-time">{u.timestamp.slice(0, 19).replace('T', ' ')}</span>
+                      <span className="log-level info">[LLM]</span>
+                      <span className="log-message">
+                        {u.provider === 'ollama' ? '🏠' : '🔑'} {u.provider} / {u.model}
+                        {u.context && ` (${u.context})`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -819,14 +1004,14 @@ Perfect for non-technical users who want to automate their workflows!
                     addLog('system', 'info', `Local model switched to ${e.target.value}`);
                   }}
                 >
-                  <option value="phi3">phi3 (Phi-3 Mini – recommended)</option>
-                  <option value="phi3:medium">phi3:medium</option>
-                  <option value="llama3">llama3 (Llama 3 8B)</option>
+                  <option value="llama3">llama3 (Llama 3 8B – default)</option>
                   <option value="llama3:8b">llama3:8b</option>
+                  <option value="phi3">phi3 (Phi-3 Mini)</option>
+                  <option value="phi3:medium">phi3:medium</option>
                   <option value="mistral">mistral</option>
                 </select>
                 <p className="setting-description">
-                  Used when no external API key is set. Pull with: <code>ollama pull {localModel}</code>
+                  Used offline when no external API key is set. Pull with: <code>ollama pull {localModel}</code>
                 </p>
               </div>
               <button onClick={checkOllamaConnection} className="check-btn">🔄 Check Connection</button>
@@ -928,6 +1113,19 @@ Perfect for non-technical users who want to automate their workflows!
         onEdit={setPendingContent}
         onCancel={handleCancel}
       />
+
+      {/* Floating Assistant Icon – always visible */}
+      <button
+        className={`floating-assistant-btn ${isChatOpen ? 'open' : ''}`}
+        title={isChatOpen ? 'Minimise chat' : 'Open chat'}
+        onClick={() => {
+          setIsChatOpen(prev => !prev);
+          if (!isChatOpen) setActiveTab('chat');
+        }}
+        aria-label="Toggle chat panel"
+      >
+        {isChatOpen ? '✕' : '🤖'}
+      </button>
     </div>
   );
 }

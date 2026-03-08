@@ -48,8 +48,193 @@ fn python_cmd() -> &'static str {
 }
 
 // ============================================================
-// Ollama / LLM
+// LLM Usage logging
 // ============================================================
+
+#[tauri::command]
+fn db_record_llm_usage(provider: String, model: String, context: String) -> Result<(), String> {
+    let ts = Utc::now().to_rfc3339();
+    db::record_llm_usage(&provider, &model, &context, &ts).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_llm_usage(limit: Option<usize>) -> Result<Vec<db::LlmUsageRow>, String> {
+    db::get_llm_usage(limit.unwrap_or(100)).map_err(|e| e.to_string())
+}
+
+// ============================================================
+// Heartbeats
+// ============================================================
+
+#[tauri::command]
+fn db_upsert_heartbeat(
+    agent_id: String,
+    interval_min: i64,
+    enabled: bool,
+) -> Result<String, String> {
+    let id = Uuid::new_v4().to_string();
+    let row = db::HeartbeatRow {
+        id: id.clone(),
+        agent_id,
+        interval_min,
+        enabled,
+        last_check: None,
+        created_at: Utc::now().to_rfc3339(),
+    };
+    db::upsert_heartbeat(&row).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn db_list_heartbeats() -> Result<Vec<db::HeartbeatRow>, String> {
+    db::list_heartbeats().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_delete_heartbeat(id: String) -> Result<(), String> {
+    db::delete_heartbeat(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_heartbeat_runs(
+    agent_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<db::HeartbeatRunRow>, String> {
+    db::get_heartbeat_runs(agent_id.as_deref(), limit.unwrap_or(100))
+        .map_err(|e| e.to_string())
+}
+
+// ============================================================
+// External LLM (OpenAI / Anthropic) – async HTTP via reqwest
+// ============================================================
+
+#[derive(Deserialize)]
+struct ExternalLlmRequest {
+    message: String,
+    history: Vec<OllamaMessage>,
+    api_key: String,
+    model: String,
+    context: Option<String>,
+}
+
+#[tauri::command]
+async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String, String> {
+    println!("Sending message to external LLM model: {}", req.model);
+
+    let client = reqwest::Client::new();
+    let system_prompt = "You are Personaliz Desktop Assistant. You help users set up OpenClaw \
+                         automation without touching command line. Be concise and helpful.";
+
+    let mut history = req.history;
+    history.push(OllamaMessage { role: "user".to_string(), content: req.message.clone() });
+
+    let response_text = if req.model.contains("claude") {
+        // Anthropic Claude API
+        let messages: Vec<serde_json::Value> = history.iter().map(|m| {
+            serde_json::json!({"role": m.role, "content": m.content})
+        }).collect();
+
+        let body = serde_json::json!({
+            "model": req.model,
+            "max_tokens": 500,
+            "system": system_prompt,
+            "messages": messages,
+        });
+
+        let resp = client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("Content-Type", "application/json")
+            .header("x-api-key", &req.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Anthropic request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Anthropic API error: {}", resp.status()));
+        }
+
+        let data: serde_json::Value = resp.json().await
+            .map_err(|e| format!("Failed to parse Anthropic response: {e}"))?;
+        data["content"][0]["text"]
+            .as_str()
+            .unwrap_or("No response.")
+            .to_string()
+    } else {
+        // OpenAI-compatible API
+        let messages: Vec<serde_json::Value> = std::iter::once(
+            serde_json::json!({"role": "system", "content": system_prompt})
+        ).chain(history.iter().map(|m| {
+            serde_json::json!({"role": m.role, "content": m.content})
+        })).collect();
+
+        let body = serde_json::json!({
+            "model": req.model,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 500,
+        });
+
+        let resp = client
+            .post("https://api.openai.com/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", req.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("OpenAI request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("OpenAI API error: {}", resp.status()));
+        }
+
+        let data: serde_json::Value = resp.json().await
+            .map_err(|e| format!("Failed to parse OpenAI response: {e}"))?;
+        data["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("No response.")
+            .to_string()
+    };
+
+    // Log LLM usage to SQLite
+    let provider = if req.model.contains("claude") { "anthropic" } else { "openai" };
+    let ctx = req.context.unwrap_or_default();
+    let _ = db::record_llm_usage(provider, &req.model, &ctx, &Utc::now().to_rfc3339());
+
+    Ok(response_text)
+}
+
+// ============================================================
+// OpenClaw dependency checks (OS-aware)
+// ============================================================
+
+#[tauri::command]
+fn check_node_available() -> bool {
+    Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn check_playwright_available() -> bool {
+    Command::new(python_cmd())
+        .args(["-c", "import playwright; print('ok')"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn get_os_info() -> serde_json::Value {
+    serde_json::json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "family": std::env::consts::FAMILY,
+    })
+}
 
 #[tauri::command]
 fn check_ollama_status() -> bool {
@@ -61,11 +246,12 @@ async fn send_message_to_llm(
     message: String,
     history: Vec<OllamaMessage>,
     model: Option<String>,
+    context: Option<String>,
 ) -> Result<String, String> {
     println!("Sending message to Ollama LLM");
 
-    // Default: phi3 (small, offline-friendly)
-    let selected_model = model.unwrap_or_else(|| "phi3".to_string());
+    // Default: llama3 (installed locally per project requirements)
+    let selected_model = model.unwrap_or_else(|| "llama3".to_string());
 
     let client = reqwest::Client::new();
 
@@ -82,7 +268,7 @@ async fn send_message_to_llm(
     });
 
     let request_body = OllamaRequest {
-        model: selected_model,
+        model: selected_model.clone(),
         messages,
         stream: false,
     };
@@ -95,7 +281,12 @@ async fn send_message_to_llm(
     {
         Ok(response) if response.status().is_success() => {
             match response.json::<OllamaResponse>().await {
-                Ok(r) => Ok(r.message.content),
+                Ok(r) => {
+                    // Log LLM usage to SQLite
+                    let ctx = context.unwrap_or_default();
+                    let _ = db::record_llm_usage("ollama", &selected_model, &ctx, &Utc::now().to_rfc3339());
+                    Ok(r.message.content)
+                }
                 Err(e) => Err(format!("Failed to parse LLM response: {e}")),
             }
         }
@@ -483,9 +674,14 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            // LLM
+            // LLM – local
             check_ollama_status,
             send_message_to_llm,
+            // LLM – external (OpenAI / Anthropic)
+            send_message_to_external_llm,
+            // LLM usage log
+            db_record_llm_usage,
+            db_get_llm_usage,
             // Agent execution
             execute_agent,
             run_python_agent,
@@ -496,8 +692,11 @@ fn main() {
             check_openclaw_installed,
             install_openclaw,
             run_openclaw_command,
-            // Python check
+            // Python / Node / Playwright checks
             check_python_available,
+            check_node_available,
+            check_playwright_available,
+            get_os_info,
             // DB – agents
             db_upsert_agent,
             db_list_agents,
@@ -512,6 +711,11 @@ fn main() {
             db_get_logs,
             // DB – run history
             db_get_run_history,
+            // DB – heartbeats
+            db_upsert_heartbeat,
+            db_list_heartbeats,
+            db_delete_heartbeat,
+            db_get_heartbeat_runs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -12,7 +12,7 @@ const AgentCreationModal: React.FC<AgentCreationModalProps> = ({ onClose, onCrea
     name: '',
     role: '',
     goal: '',
-    tools: [],
+    tools: [] as string[],
     schedule: 'Daily'
   });
 

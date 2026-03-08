@@ -9,9 +9,9 @@ use chrono::{DateTime, Utc, Duration as ChronoDuration};
 
 use crate::db;
 
-/// Spawn the scheduler loop as a detached Tokio task.
+/// Spawn the scheduler loop as a detached Tauri async-runtime task.
 pub fn start(agent_engine_path: PathBuf) {
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
             run_due_schedules(&agent_engine_path);

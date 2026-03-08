@@ -27,17 +27,30 @@ static DB: Lazy<Mutex<Connection>> = Lazy::new(|| {
 
 fn db_path() -> PathBuf {
     let base = dirs_next();
-    base.join("personaliz-assistant").join("data.db")
+    let path = base.join("personaliz-assistant").join("data.db");
+    // Ensure the parent directory exists so SQLite can create the file.
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[db] Failed to create database directory {:?}: {e}", parent);
+        }
+    }
+    path
 }
 
 fn dirs_next() -> PathBuf {
-    // Try standard env vars first, then fallback to a known safe path
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        return PathBuf::from(home).join(".local").join("share");
+    // On Windows prefer APPDATA (C:\Users\<user>\AppData\Roaming) over ~/.local/share
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata);
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(profile).join("AppData").join("Roaming");
+        }
     }
-    // On Windows, try APPDATA
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return PathBuf::from(appdata);
+    // On Linux/macOS use $HOME/.local/share
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local").join("share");
     }
     // Last resort: use temp dir to avoid writing in unpredictable cwd
     std::env::temp_dir()

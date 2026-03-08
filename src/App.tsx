@@ -686,6 +686,9 @@ Perfect for non-technical users who want to automate their workflows!
 
 #OpenClaw #Automation #NoCode #RPA #AI`;
 
+  /** Format an ISO 8601 timestamp to 'YYYY-MM-DD HH:MM:SS' for display. */
+  const fmtTs = (ts: string) => ts.slice(0, 19).replace('T', ' ');
+
   // -------------------------------------------------------------------------
   // Onboarding
   // -------------------------------------------------------------------------
@@ -845,7 +848,7 @@ Perfect for non-technical users who want to automate their workflows!
                           {agentHeartbeat ? (
                             <span style={{ color: 'var(--success)' }}>
                               💓 Every {agentHeartbeat.interval_min} min
-                              {agentHeartbeat.last_check && ` (last: ${agentHeartbeat.last_check.slice(0, 16).replace('T', ' ')})`}
+                              {agentHeartbeat.last_check && ` (last: ${fmtTs(agentHeartbeat.last_check)})`}
                             </span>
                           ) : (
                             <span style={{ color: 'var(--text-secondary)' }}>Off</span>
@@ -892,7 +895,7 @@ Perfect for non-technical users who want to automate their workflows!
                 <div className="logs-list">
                   {runHistory.slice(0, 20).map(r => (
                     <div key={r.id} className={`log-entry ${r.status === 'success' ? 'success' : r.status === 'running' ? 'info' : 'error'}`}>
-                      <span className="log-time">{r.startedAt.slice(0, 19).replace('T', ' ')}</span>
+                      <span className="log-time">{fmtTs(r.startedAt)}</span>
                       <span className={`log-level ${r.status}`}>[{r.status.toUpperCase()}]</span>
                       <span className="log-message">Agent {r.agentId.slice(-8)} – {r.result?.slice(0, 80) || 'No result'}</span>
                     </div>
@@ -915,7 +918,7 @@ Perfect for non-technical users who want to automate their workflows!
                 <div className="logs-list">
                   {heartbeatRuns.slice(0, 30).map(r => (
                     <div key={r.id} className={`log-entry ${r.status === 'ok' ? 'success' : r.status === 'idle' ? 'info' : 'error'}`}>
-                      <span className="log-time">{r.checked_at.slice(0, 19).replace('T', ' ')}</span>
+                      <span className="log-time">{fmtTs(r.checked_at)}</span>
                       <span className={`log-level ${r.status === 'ok' ? 'success' : 'info'}`}>[{r.status.toUpperCase()}]</span>
                       <span className="log-message">Agent {r.agent_id.slice(-8)} – {r.message || 'No message'}</span>
                     </div>
@@ -951,7 +954,7 @@ Perfect for non-technical users who want to automate their workflows!
                 <div className="logs-list">
                   {llmUsage.slice(0, 20).map(u => (
                     <div key={u.id} className="log-entry info">
-                      <span className="log-time">{u.timestamp.slice(0, 19).replace('T', ' ')}</span>
+                      <span className="log-time">{fmtTs(u.timestamp)}</span>
                       <span className="log-level info">[LLM]</span>
                       <span className="log-message">
                         {u.provider === 'ollama' ? '🏠' : '🔑'} {u.provider} / {u.model}
@@ -1117,7 +1120,7 @@ Perfect for non-technical users who want to automate their workflows!
       {/* Floating Assistant Icon – always visible */}
       <button
         className={`floating-assistant-btn ${isChatOpen ? 'open' : ''}`}
-        title={isChatOpen ? 'Minimise chat' : 'Open chat'}
+        title={isChatOpen ? 'Minimize chat' : 'Open chat'}
         onClick={() => {
           setIsChatOpen(prev => !prev);
           if (!isChatOpen) setActiveTab('chat');

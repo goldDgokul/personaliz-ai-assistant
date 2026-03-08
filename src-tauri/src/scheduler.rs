@@ -216,11 +216,13 @@ fn run_due_heartbeats() {
         let (status, message) = match db::get_run_history(Some(&hb.agent_id), 1) {
             Ok(history) if !history.is_empty() => {
                 let last = &history[0];
-                let msg = format!(
-                    "Last run: {} – {}",
-                    last.started_at.get(..19).unwrap_or(&last.started_at),
-                    last.status
-                );
+        // ISO 8601 prefix length 'YYYY-MM-DDTHH:MM:SS' == 19 chars
+        const TIMESTAMP_DISPLAY_LEN: usize = 19;
+        let msg = format!(
+            "Last run: {} – {}",
+            last.started_at.get(..TIMESTAMP_DISPLAY_LEN).unwrap_or(&last.started_at),
+            last.status
+        );
                 ("ok".to_string(), msg)
             }
             Ok(_) => ("idle".to_string(), "No runs recorded yet".to_string()),

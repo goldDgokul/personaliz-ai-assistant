@@ -250,7 +250,7 @@ async fn send_message_to_llm(
 ) -> Result<String, String> {
     println!("Sending message to Ollama LLM");
 
-    // Default: llama3 (installed locally per project requirements)
+    // Default: llama3 (recommended local model – pull with: ollama pull llama3)
     let selected_model = model.unwrap_or_else(|| "llama3".to_string());
 
     let client = reqwest::Client::new();

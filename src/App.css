@@ -806,6 +806,7 @@ body {
 }
 
 .approval-modal-content {
+  background: var(--card-bg, var(--surface));
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -898,6 +899,9 @@ body {
 }
 
 .approval-modal-footer .approve-btn:hover {
+  background: #4a9eff;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3);
   background: var(--primary-dark);
   transform: translateY(-1px);
   box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
@@ -905,6 +909,7 @@ body {
 
 /* Status badge updates */
 .status-badge.awaiting-approval {
+  background: #ffa500;
   background: var(--warning);
   color: white;
   animation: pulse 2s infinite;

@@ -2,10 +2,13 @@
 ///
 /// Tables
 /// ------
-/// agents       – stored agent definitions
-/// schedules    – when each agent should run (hourly / daily)
-/// logs         – append-only execution log
-/// run_history  – one row per agent invocation with result summary
+/// agents          – stored agent definitions
+/// schedules       – when each agent should run (hourly / daily)
+/// logs            – append-only execution log
+/// run_history     – one row per agent invocation with result summary
+/// heartbeats      – per-agent heartbeat config (interval, enabled)
+/// heartbeat_runs  – history of heartbeat check outcomes
+/// llm_usage       – log which model/provider was used for each LLM call
 use rusqlite::{Connection, Result as SqlResult, params};
 use serde::{Deserialize, Serialize};
 use once_cell::sync::Lazy;
@@ -95,6 +98,31 @@ fn init_schema(conn: &Connection) -> SqlResult<()> {
             status      TEXT NOT NULL DEFAULT 'running',
             result      TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS heartbeats (
+            id           TEXT PRIMARY KEY,
+            agent_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            interval_min INTEGER NOT NULL DEFAULT 60,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            last_check   TEXT,
+            created_at   TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS heartbeat_runs (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id   TEXT NOT NULL,
+            checked_at TEXT NOT NULL,
+            status     TEXT NOT NULL,
+            message    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS llm_usage (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider   TEXT NOT NULL,
+            model      TEXT NOT NULL,
+            context    TEXT NOT NULL DEFAULT '',
+            timestamp  TEXT NOT NULL
+        );
         "#,
     )
 }
@@ -142,6 +170,34 @@ pub struct RunHistoryRow {
     pub finished_at: Option<String>,
     pub status: String,
     pub result: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeartbeatRow {
+    pub id: String,
+    pub agent_id: String,
+    pub interval_min: i64,
+    pub enabled: bool,
+    pub last_check: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeartbeatRunRow {
+    pub id: i64,
+    pub agent_id: String,
+    pub checked_at: String,
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LlmUsageRow {
+    pub id: i64,
+    pub provider: String,
+    pub model: String,
+    pub context: String,
+    pub timestamp: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +429,134 @@ pub fn get_run_history(agent_id: Option<&str>, limit: usize) -> SqlResult<Vec<Ru
         })?;
         rows.collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeats
+// ---------------------------------------------------------------------------
+
+pub fn upsert_heartbeat(h: &HeartbeatRow) -> SqlResult<()> {
+    let db = DB.lock().unwrap();
+    db.execute(
+        "INSERT INTO heartbeats (id, agent_id, interval_min, enabled, last_check, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+           interval_min=excluded.interval_min,
+           enabled=excluded.enabled",
+        params![
+            h.id, h.agent_id, h.interval_min, h.enabled as i32,
+            h.last_check, h.created_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn list_heartbeats() -> SqlResult<Vec<HeartbeatRow>> {
+    let db = DB.lock().unwrap();
+    let mut stmt = db.prepare(
+        "SELECT id, agent_id, interval_min, enabled, last_check, created_at
+         FROM heartbeats ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(HeartbeatRow {
+            id: row.get(0)?,
+            agent_id: row.get(1)?,
+            interval_min: row.get(2)?,
+            enabled: row.get::<_, i32>(3)? != 0,
+            last_check: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn update_heartbeat_last_check(id: &str, last_check: &str) -> SqlResult<()> {
+    let db = DB.lock().unwrap();
+    db.execute(
+        "UPDATE heartbeats SET last_check = ?1 WHERE id = ?2",
+        params![last_check, id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_heartbeat(id: &str) -> SqlResult<()> {
+    let db = DB.lock().unwrap();
+    db.execute("DELETE FROM heartbeats WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn record_heartbeat_run(agent_id: &str, checked_at: &str, status: &str, message: &str) -> SqlResult<i64> {
+    let db = DB.lock().unwrap();
+    db.execute(
+        "INSERT INTO heartbeat_runs (agent_id, checked_at, status, message) VALUES (?1, ?2, ?3, ?4)",
+        params![agent_id, checked_at, status, message],
+    )?;
+    Ok(db.last_insert_rowid())
+}
+
+pub fn get_heartbeat_runs(agent_id: Option<&str>, limit: usize) -> SqlResult<Vec<HeartbeatRunRow>> {
+    let db = DB.lock().unwrap();
+    if let Some(aid) = agent_id {
+        let mut stmt = db.prepare(
+            "SELECT id, agent_id, checked_at, status, message
+             FROM heartbeat_runs WHERE agent_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![aid, limit as i64], |row| {
+            Ok(HeartbeatRunRow {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                checked_at: row.get(2)?,
+                status: row.get(3)?,
+                message: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    } else {
+        let mut stmt = db.prepare(
+            "SELECT id, agent_id, checked_at, status, message
+             FROM heartbeat_runs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(HeartbeatRunRow {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                checked_at: row.get(2)?,
+                status: row.get(3)?,
+                message: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LLM usage log
+// ---------------------------------------------------------------------------
+
+pub fn record_llm_usage(provider: &str, model: &str, context: &str, timestamp: &str) -> SqlResult<()> {
+    let db = DB.lock().unwrap();
+    db.execute(
+        "INSERT INTO llm_usage (provider, model, context, timestamp) VALUES (?1, ?2, ?3, ?4)",
+        params![provider, model, context, timestamp],
+    )?;
+    Ok(())
+}
+
+pub fn get_llm_usage(limit: usize) -> SqlResult<Vec<LlmUsageRow>> {
+    let db = DB.lock().unwrap();
+    let mut stmt = db.prepare(
+        "SELECT id, provider, model, context, timestamp FROM llm_usage ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        Ok(LlmUsageRow {
+            id: row.get(0)?,
+            provider: row.get(1)?,
+            model: row.get(2)?,
+            context: row.get(3)?,
+            timestamp: row.get(4)?,
+        })
+    })?;
+    rows.collect()
 }
 
 /// Ensure the database is initialised (call once at startup).

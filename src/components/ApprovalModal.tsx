@@ -41,7 +41,7 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({ isOpen, content, o
             ❌ Discard
           </button>
           <button onClick={onApprove} className="approve-btn">
-            ✅ Approve &amp; Execute
+            ✅ Approve & Execute
           </button>
         </div>
       </div>

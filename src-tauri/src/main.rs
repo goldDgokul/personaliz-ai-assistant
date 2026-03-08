@@ -1,8 +1,17 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
-use std::process::Command;
+mod db;
+mod scheduler;
+
 use std::path::PathBuf;
+use std::process::Command;
 use serde::{Deserialize, Serialize};
+use chrono::Utc;
+use uuid::Uuid;
+
+// ============================================================
+// Ollama / LLM structs
+// ============================================================
 
 #[derive(Serialize, Deserialize)]
 struct OllamaMessage {
@@ -22,21 +31,82 @@ struct OllamaResponse {
     message: OllamaMessage,
 }
 
-// ========== EXISTING COMMANDS (Kept) ==========
+// ============================================================
+// Helper: locate agent_engine.py relative to the Tauri binary
+// ============================================================
+
+fn agent_engine_path() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop(); // src-tauri -> project root
+    p.push("public");
+    p.push("agent_engine.py");
+    p
+}
+
+fn python_cmd() -> &'static str {
+    if cfg!(target_os = "windows") { "python" } else { "python3" }
+}
+
+// ============================================================
+// Ollama / LLM
+// ============================================================
 
 #[tauri::command]
 fn check_ollama_status() -> bool {
-    match std::net::TcpStream::connect("127.0.0.1:11434") {
-        Ok(_) => {
-            println!("Ollama is running on localhost:11434");
-            true
-        },
-        Err(_) => {
-            println!("Ollama is not running on localhost:11434");
-            false
+    std::net::TcpStream::connect("127.0.0.1:11434").is_ok()
+}
+
+#[tauri::command]
+async fn send_message_to_llm(
+    message: String,
+    history: Vec<OllamaMessage>,
+    model: Option<String>,
+) -> Result<String, String> {
+    println!("Sending message to Ollama LLM");
+
+    // Default: phi3 (small, offline-friendly)
+    let selected_model = model.unwrap_or_else(|| "phi3".to_string());
+
+    let client = reqwest::Client::new();
+
+    let mut messages = vec![OllamaMessage {
+        role: "system".to_string(),
+        content: "You are Personaliz Desktop Assistant. You help users set up OpenClaw automation \
+                  without touching command line. Be concise and helpful.".to_string(),
+    }];
+
+    messages.extend(history);
+    messages.push(OllamaMessage {
+        role: "user".to_string(),
+        content: message,
+    });
+
+    let request_body = OllamaRequest {
+        model: selected_model,
+        messages,
+        stream: false,
+    };
+
+    match client
+        .post("http://localhost:11434/api/chat")
+        .json(&request_body)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<OllamaResponse>().await {
+                Ok(r) => Ok(r.message.content),
+                Err(e) => Err(format!("Failed to parse LLM response: {e}")),
+            }
         }
+        Ok(response) => Err(format!("Ollama returned error: {}", response.status())),
+        Err(e) => Err(format!("Failed to connect to Ollama: {e}")),
     }
 }
+
+// ============================================================
+// Agent execution (Python)
+// ============================================================
 
 #[tauri::command]
 fn execute_agent(
@@ -49,14 +119,7 @@ fn execute_agent(
 ) -> Result<String, String> {
     println!("Executing agent: {} ({})", agent_id, agent_name);
 
-    // Get correct path to agent_engine.py (go UP from src-tauri to project root)
-    let mut agent_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    agent_path.pop(); // Go up from src-tauri
-    agent_path.push("public");
-    agent_path.push("agent_engine.py");
-
-    println!("Looking for agent_engine.py at: {:?}", agent_path);
-
+    let agent_path = agent_engine_path();
     if !agent_path.exists() {
         return Err(format!("agent_engine.py not found at: {:?}", agent_path));
     }
@@ -64,8 +127,8 @@ fn execute_agent(
     let mode = if sandbox { "sandbox" } else { "prod" };
     let tools_str = tools.join(",");
 
-    let output = Command::new("python")
-        .arg(agent_path)
+    let output = Command::new(python_cmd())
+        .arg(&agent_path)
         .arg(&agent_id)
         .arg(&agent_name)
         .arg(&role)
@@ -73,204 +136,182 @@ fn execute_agent(
         .arg(&tools_str)
         .arg(mode)
         .output()
-        .map_err(|e| {
-            let err_msg = format!("Failed to execute agent: {}", e.to_string());
-            println!("{}", err_msg);
-            err_msg
-        })?;
-
-    let result = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        .map_err(|e| format!("Failed to execute agent: {e}"))?;
 
     if output.status.success() {
-        println!("Agent execution successful");
-        Ok(result.trim().to_string())
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
-        let err_msg = format!("Agent execution failed: {}", stderr);
-        println!("{}", err_msg);
-        Err(err_msg)
+        Err(format!(
+            "Agent execution failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
     }
 }
 
 #[tauri::command]
-fn post_to_linkedin(content: String, sandbox: bool) -> Result<String, String> {
-    println!("Posting to LinkedIn (sandbox: {})", sandbox);
+fn run_python_agent(
+    agent_id: String,
+    agent_name: String,
+    sandbox: bool,
+) -> Result<serde_json::Value, String> {
+    println!("Running Python agent: {} (sandbox: {})", agent_name, sandbox);
 
-    // Get correct path
-    let mut agent_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    agent_path.pop();
-    agent_path.push("public");
-    agent_path.push("agent_engine.py");
-
+    let agent_path = agent_engine_path();
     if !agent_path.exists() {
         return Err(format!("agent_engine.py not found at: {:?}", agent_path));
     }
 
-    let mode = if sandbox { "sandbox" } else { "prod" };
+    let sandbox_arg = if sandbox { "sandbox" } else { "live" };
 
-    let output = Command::new("python")
-        .arg(agent_path)
-        .arg("linkedin_post")
-        .arg(&content)
-        .arg(mode)
+    let output = Command::new(python_cmd())
+        .arg(&agent_path)
+        .arg(&agent_id)
+        .arg(sandbox_arg)
         .output()
-        .map_err(|e| {
-            let err_msg = format!("Failed to post to LinkedIn: {}", e.to_string());
-            println!("{}", err_msg);
-            err_msg
-        })?;
-
-    let result = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        .map_err(|e| format!("Failed to execute Python agent: {e}"))?;
 
     if output.status.success() {
-        println!("LinkedIn post successful");
-        Ok(result.trim().to_string())
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match serde_json::from_str::<serde_json::Value>(&stdout) {
+            Ok(json) => Ok(json),
+            Err(_) => Ok(serde_json::json!({
+                "status": "success",
+                "message": stdout.to_string(),
+                "logs": []
+            })),
+        }
     } else {
-        let err_msg = format!("LinkedIn post failed: {}", stderr);
-        println!("{}", err_msg);
-        Err(err_msg)
+        Err(format!(
+            "Python agent failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
     }
 }
+
+// ============================================================
+// LinkedIn commands (new CLI contract)
+// ============================================================
+
+/// Post approved content to LinkedIn.
+/// Calls: python agent_engine.py linkedin_post --content <…> --sandbox <true|false>
+#[tauri::command]
+fn post_to_linkedin(content: String, sandbox: bool) -> Result<String, String> {
+    println!("Posting to LinkedIn (sandbox: {})", sandbox);
+
+    let agent_path = agent_engine_path();
+    if !agent_path.exists() {
+        return Err(format!("agent_engine.py not found at: {:?}", agent_path));
+    }
+
+    let sandbox_flag = if sandbox { "true" } else { "false" };
+
+    let output = Command::new(python_cmd())
+        .arg(&agent_path)
+        .arg("linkedin_post")
+        .arg("--content")
+        .arg(&content)
+        .arg("--sandbox")
+        .arg(sandbox_flag)
+        .output()
+        .map_err(|e| format!("Failed to post to LinkedIn: {e}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "LinkedIn post failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+/// Comment on posts tagged with a LinkedIn hashtag.
+/// Calls: python agent_engine.py linkedin_comment_hashtag --hashtag <…> --comment <…> --sandbox <…>
+#[tauri::command]
+fn comment_linkedin_hashtag(
+    hashtag: String,
+    comment: String,
+    sandbox: bool,
+) -> Result<serde_json::Value, String> {
+    println!("Commenting on #{} (sandbox: {})", hashtag, sandbox);
+
+    let agent_path = agent_engine_path();
+    if !agent_path.exists() {
+        return Err(format!("agent_engine.py not found at: {:?}", agent_path));
+    }
+
+    let sandbox_flag = if sandbox { "true" } else { "false" };
+
+    let output = Command::new(python_cmd())
+        .arg(&agent_path)
+        .arg("linkedin_comment_hashtag")
+        .arg("--hashtag")
+        .arg(&hashtag)
+        .arg("--comment")
+        .arg(&comment)
+        .arg("--sandbox")
+        .arg(sandbox_flag)
+        .output()
+        .map_err(|e| format!("Failed to run hashtag agent: {e}"))?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        serde_json::from_str::<serde_json::Value>(&stdout).map_err(|e| {
+            format!("Failed to parse hashtag agent output: {e}\nOutput: {stdout}")
+        })
+    } else {
+        Err(format!(
+            "Hashtag comment agent failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+// ============================================================
+// OpenClaw
+// ============================================================
 
 #[tauri::command]
 fn check_openclaw_installed() -> bool {
-    let cmd = if cfg!(target_os = "windows") {
-        "where"
-    } else {
-        "which"
-    };
-
-    match Command::new(cmd)
+    let cmd = if cfg!(target_os = "windows") { "where" } else { "which" };
+    Command::new(cmd)
         .arg("openclaw")
         .output()
-    {
-        Ok(output) => {
-            let is_installed = output.status.success();
-            if is_installed {
-                println!("OpenClaw is installed");
-            } else {
-                println!("OpenClaw is not installed");
-            }
-            is_installed
-        },
-        Err(e) => {
-            println!("Failed to check OpenClaw installation: {}", e);
-            false
-        }
-    }
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
-// ========== NEW COMMANDS (Added) ==========
-
 #[tauri::command]
-fn check_python_available() -> bool {
+fn install_openclaw() -> Result<String, String> {
+    println!("Installing OpenClaw via npm...");
+
     let output = if cfg!(target_os = "windows") {
-        Command::new("python")
-            .arg("--version")
+        Command::new("cmd")
+            .args(["/C", "npm install -g openclaw"])
             .output()
     } else {
-        Command::new("python3")
-            .arg("--version")
+        Command::new("sh")
+            .args(["-c", "npm install -g openclaw"])
             .output()
     };
 
     match output {
         Ok(result) => {
-            let is_available = result.status.success();
-            if is_available {
-                println!("Python is available");
+            let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&result.stderr).to_string();
+            if result.status.success() {
+                println!("OpenClaw installed successfully");
+                Ok(format!("OK: OpenClaw installed.\n{stdout}"))
             } else {
-                println!("Python is not available");
-            }
-            is_available
-        },
-        Err(e) => {
-            println!("Python check failed: {}", e);
-            false
-        }
-    }
-}
-
-#[tauri::command]
-fn run_python_agent(agent_id: String, agent_name: String, sandbox: bool) -> Result<serde_json::Value, String> {
-    println!("Running Python agent: {} (sandbox: {})", agent_name, sandbox);
-
-    // Get correct path
-    let mut agent_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    agent_path.pop(); // Go up from src-tauri to project root
-    agent_path.push("public");
-    agent_path.push("agent_engine.py");
-
-    println!("Looking for agent_engine.py at: {:?}", agent_path);
-
-    if !agent_path.exists() {
-        return Err(format!("agent_engine.py not found at: {:?}", agent_path));
-    }
-
-    let python_cmd = if cfg!(target_os = "windows") {
-        "python"
-    } else {
-        "python3"
-    };
-
-    let sandbox_arg = if sandbox { "sandbox" } else { "live" };
-
-    let output = Command::new(python_cmd)
-        .arg(agent_path)
-        .arg(&agent_id)
-        .arg(sandbox_arg)
-        .output()
-        .map_err(|e| {
-            let err_msg = format!("Failed to execute Python agent: {}", e);
-            println!("{}", err_msg);
-            err_msg
-        })?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        match serde_json::from_str::<serde_json::Value>(&stdout) {
-            Ok(json) => {
-                println!("Python agent executed successfully");
-                Ok(json)
-            },
-            Err(_) => {
-                println!("Python agent output (non-JSON): {}", stdout);
-                Ok(serde_json::json!({
-                    "status": "success",
-                    "message": stdout.to_string(),
-                    "logs": []
-                }))
+                Err(format!(
+                    "npm install failed. Make sure Node.js is installed.\n{stderr}"
+                ))
             }
         }
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let err_msg = format!("Python agent failed: {}", stderr);
-        println!("{}", err_msg);
-        Err(err_msg)
+        Err(e) => Err(format!(
+            "Failed to run npm: {e}. Please install Node.js first."
+        )),
     }
-}
-
-#[tauri::command]
-fn install_openclaw() -> String {
-    let instructions = if cfg!(target_os = "windows") {
-        "To install OpenClaw on Windows:\n\
-         1. Download from: https://github.com/openclaw/openclaw\n\
-         2. Run: npm install -g openclaw\n\
-         3. Or follow installation instructions in the repository"
-    } else if cfg!(target_os = "macos") {
-        "To install OpenClaw on macOS:\n\
-         1. Run: brew install openclaw\n\
-         2. Or: npm install -g openclaw"
-    } else {
-        "To install OpenClaw on Linux:\n\
-         1. Run: npm install -g openclaw\n\
-         2. Or follow installation instructions"
-    };
-
-    println!("Install instructions requested");
-    instructions.to_string()
 }
 
 #[tauri::command]
@@ -279,108 +320,198 @@ fn run_openclaw_command(command: String) -> Result<String, String> {
 
     let output = if cfg!(target_os = "windows") {
         Command::new("cmd")
-            .args(&["/C", &command])
+            .args(["/C", &command])
             .output()
     } else {
         Command::new("sh")
-            .arg("-c")
-            .arg(&command)
+            .args(["-c", &command])
             .output()
     };
 
     match output {
         Ok(result) => {
             if result.status.success() {
-                let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-                println!("Command executed successfully");
-                Ok(stdout)
+                Ok(String::from_utf8_lossy(&result.stdout).to_string())
             } else {
-                let stderr = String::from_utf8_lossy(&result.stderr).to_string();
-                let err_msg = format!("Command failed: {}", stderr);
-                println!("{}", err_msg);
-                Err(err_msg)
+                Err(format!(
+                    "Command failed: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                ))
             }
         }
-        Err(e) => {
-            let err_msg = format!("Failed to execute command: {}", e);
-            println!("{}", err_msg);
-            Err(err_msg)
-        }
+        Err(e) => Err(format!("Failed to execute command: {e}")),
     }
+}
+
+// ============================================================
+// Python availability
+// ============================================================
+
+#[tauri::command]
+fn check_python_available() -> bool {
+    Command::new(python_cmd())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+// ============================================================
+// DB – Agents
+// ============================================================
+
+#[tauri::command]
+fn db_upsert_agent(
+    id: String,
+    name: String,
+    role: String,
+    goal: String,
+    tools: String,
+    status: String,
+) -> Result<(), String> {
+    let row = db::AgentRow {
+        id,
+        name,
+        role,
+        goal,
+        tools,
+        status,
+        created_at: Utc::now().to_rfc3339(),
+    };
+    db::upsert_agent(&row).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn send_message_to_llm(message: String, history: Vec<OllamaMessage>) -> Result<String, String> {
-    println!("Sending message to Ollama LLM");
-
-    let client = reqwest::Client::new();
-
-    let mut messages = vec![
-        OllamaMessage {
-            role: "system".to_string(),
-            content: "You are Personaliz Desktop Assistant. You help users set up OpenClaw automation without touching command line. Be concise and helpful.".to_string(),
-        }
-    ];
-
-    messages.extend(history);
-    messages.push(OllamaMessage {
-        role: "user".to_string(),
-        content: message,
-    });
-
-    let request_body = OllamaRequest {
-        model: "llama3:8b".to_string(),
-        messages,
-        stream: false,
-    };
-
-    match client
-        .post("http://localhost:11434/api/chat")
-        .json(&request_body)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            if response.status().is_success() {
-                match response.json::<OllamaResponse>().await {
-                    Ok(ollama_response) => {
-                        println!("LLM response received");
-                        Ok(ollama_response.message.content)
-                    },
-                    Err(e) => {
-                        let err_msg = format!("Failed to parse LLM response: {}", e);
-                        println!("{}", err_msg);
-                        Err(err_msg)
-                    }
-                }
-            } else {
-                let err_msg = format!("Ollama returned error: {}", response.status());
-                println!("{}", err_msg);
-                Err(err_msg)
-            }
-        }
-        Err(e) => {
-            let err_msg = format!("Failed to connect to Ollama: {}", e);
-            println!("{}", err_msg);
-            Err(err_msg)
-        }
-    }
+fn db_list_agents() -> Result<Vec<db::AgentRow>, String> {
+    db::list_agents().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn db_delete_agent(id: String) -> Result<(), String> {
+    db::delete_agent(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_update_agent_status(id: String, status: String) -> Result<(), String> {
+    db::update_agent_status(&id, &status).map_err(|e| e.to_string())
+}
+
+// ============================================================
+// DB – Schedules
+// ============================================================
+
+#[tauri::command]
+fn db_upsert_schedule(
+    agent_id: String,
+    frequency: String,
+    enabled: bool,
+) -> Result<String, String> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    let next_run = scheduler::compute_next_run(&frequency, &now);
+    let row = db::ScheduleRow {
+        id: id.clone(),
+        agent_id,
+        frequency,
+        enabled,
+        last_run: None,
+        next_run: next_run.to_rfc3339(),
+        created_at: now.to_rfc3339(),
+    };
+    db::upsert_schedule(&row).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn db_list_schedules() -> Result<Vec<db::ScheduleRow>, String> {
+    db::list_schedules().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_delete_schedule(id: String) -> Result<(), String> {
+    db::delete_schedule(&id).map_err(|e| e.to_string())
+}
+
+// ============================================================
+// DB – Logs
+// ============================================================
+
+#[tauri::command]
+fn db_append_log(
+    agent_id: String,
+    level: String,
+    message: String,
+) -> Result<i64, String> {
+    let ts = Utc::now().to_rfc3339();
+    db::append_log(&agent_id, &level, &message, &ts).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_logs(agent_id: Option<String>, limit: Option<usize>) -> Result<Vec<db::LogRow>, String> {
+    db::get_logs(agent_id.as_deref(), limit.unwrap_or(200))
+        .map_err(|e| e.to_string())
+}
+
+// ============================================================
+// DB – Run history
+// ============================================================
+
+#[tauri::command]
+fn db_get_run_history(
+    agent_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<db::RunHistoryRow>, String> {
+    db::get_run_history(agent_id.as_deref(), limit.unwrap_or(100))
+        .map_err(|e| e.to_string())
+}
+
+// ============================================================
+// main
+// ============================================================
+
 fn main() {
+    // Initialise SQLite (creates tables if needed)
+    db::init();
+
+    // Build path to agent_engine.py for the scheduler
+    let engine_path = agent_engine_path();
+
     tauri::Builder::default()
+        .setup(move |_app| {
+            // Start background scheduler
+            scheduler::start(engine_path.clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            // Existing commands
+            // LLM
             check_ollama_status,
+            send_message_to_llm,
+            // Agent execution
             execute_agent,
-            post_to_linkedin,
-            check_openclaw_installed,
-            // New commands
-            check_python_available,
             run_python_agent,
+            // LinkedIn
+            post_to_linkedin,
+            comment_linkedin_hashtag,
+            // OpenClaw
+            check_openclaw_installed,
             install_openclaw,
             run_openclaw_command,
-            send_message_to_llm,
+            // Python check
+            check_python_available,
+            // DB – agents
+            db_upsert_agent,
+            db_list_agents,
+            db_delete_agent,
+            db_update_agent_status,
+            // DB – schedules
+            db_upsert_schedule,
+            db_list_schedules,
+            db_delete_schedule,
+            // DB – logs
+            db_append_log,
+            db_get_logs,
+            // DB – run history
+            db_get_run_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

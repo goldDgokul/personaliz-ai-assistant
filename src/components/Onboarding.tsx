@@ -9,10 +9,12 @@ interface OnboardingProps {
 const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
   const [step, setStep] = useState(1);
 
-  // Step 2 – Ollama
+  // Step 2 – Local LLM (Ollama or llama.cpp)
   const [ollamaConnected, setOllamaConnected] = useState(false);
+  const [llamacppConnected, setLlamacppConnected] = useState(false);
   const [checkingOllama, setCheckingOllama] = useState(false);
   const [localModel, setLocalModel] = useState('phi3');
+  const [llmBackend, setLlmBackend] = useState<'ollama' | 'llamacpp'>('ollama');
 
   // Step 3 – OpenClaw
   const [openClawInstalled, setOpenClawInstalled] = useState<boolean | null>(null);
@@ -24,28 +26,39 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
   const [anthropicKey, setAnthropicKey] = useState('');
 
   // -----------------------------------------------------------------------
-  // Step 2 helpers – Ollama
+  // Step 2 helpers – local LLM
   // -----------------------------------------------------------------------
 
   const checkOllama = async () => {
     setCheckingOllama(true);
     try {
-      // Try Tauri command
-      try {
-        const ok = await invoke<boolean>('check_ollama_status');
-        setOllamaConnected(ok);
-        if (ok) {
-          localStorage.setItem('local_model', localModel);
-          setCheckingOllama(false);
-          return;
-        }
-      } catch (_) {
-        // fall back to fetch
-      }
-      const response = await fetch('http://localhost:11434/api/tags');
-      setOllamaConnected(response.ok);
+      const ok = await invoke<boolean>('check_ollama_status');
+      setOllamaConnected(ok);
+      if (ok) localStorage.setItem('local_model', localModel);
     } catch {
-      setOllamaConnected(false);
+      try {
+        const response = await fetch('http://localhost:11434/api/tags');
+        const ok = response.ok;
+        setOllamaConnected(ok);
+        if (ok) localStorage.setItem('local_model', localModel);
+      } catch {
+        setOllamaConnected(false);
+      }
+    }
+    setCheckingOllama(false);
+  };
+
+  const checkLlamaCpp = async () => {
+    setCheckingOllama(true);
+    try {
+      const ok = await invoke<boolean>('check_llamacpp_status');
+      setLlamacppConnected(ok);
+      if (ok) {
+        localStorage.setItem('local_model', localModel);
+        localStorage.setItem('llm_backend', 'llamacpp');
+      }
+    } catch {
+      setLlamacppConnected(false);
     }
     setCheckingOllama(false);
   };
@@ -87,16 +100,13 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
   const handleSkip = () => setStep(s => Math.min(s + 1, 5));
 
   const handleComplete = () => {
-    // Persist entered API keys under separate storage keys
     if (openaiKey.trim()) {
       localStorage.setItem('openai_api_key', openaiKey.trim());
-      // Use OpenAI as the active key when both are provided
       localStorage.setItem('llm_api_key', openaiKey.trim());
       localStorage.setItem('llm_model', 'gpt-4');
     }
     if (anthropicKey.trim()) {
       localStorage.setItem('anthropic_api_key', anthropicKey.trim());
-      // Only set as active key if no OpenAI key was entered
       if (!openaiKey.trim()) {
         localStorage.setItem('llm_api_key', anthropicKey.trim());
         localStorage.setItem('llm_model', 'claude-3-5-sonnet-20241022');
@@ -123,9 +133,9 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
             <div className="features-list">
               {[
                 ['✓', 'Chat-based agent creation', 'Create automation agents just by chatting'],
-                ['✓', 'Local AI – no API key needed', 'Run Phi-3 Mini or Llama3 locally with Ollama'],
+                ['✓', 'Local AI – no API key needed', 'Run Phi-3/Llama3 via Ollama or llama.cpp — fully offline'],
                 ['✓', 'Browser automation', 'Post to LinkedIn, comment on hashtags, and more'],
-                ['✓', 'Scheduled agents', 'Run agents hourly, daily, weekly – fully automated'],
+                ['✓', 'Cron-scheduled agents', 'Run agents on any schedule – hourly, daily, or custom cron'],
               ].map(([icon, title, desc]) => (
                 <div className="feature" key={title}>
                   <span className="feature-icon">{icon}</span>
@@ -137,31 +147,67 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
           </div>
         )}
 
-        {/* STEP 2: Ollama Setup */}
+        {/* STEP 2: Local LLM Setup (Ollama or llama.cpp) */}
         {step === 2 && (
           <div className="onboarding-step">
             <div className="step-icon">🧠</div>
-            <h1>Set Up Local AI (Ollama)</h1>
-            <p>Ollama runs AI models locally – no API key or internet required.</p>
+            <h1>Set Up Local AI</h1>
+            <p>Run AI models locally – no cloud API key or internet required.</p>
 
-            <div className="setup-instructions">
-              <h3>Installation:</h3>
-              <ol>
-                <li>Download Ollama from <a href="https://ollama.ai" target="_blank" rel="noopener noreferrer">ollama.ai</a></li>
-                <li>Install and launch it</li>
-                <li>
-                  Pull a small model (pick one):<br/>
-                  <code>ollama pull phi3</code> &nbsp;← recommended (3 GB, fast)<br/>
-                  <code>ollama pull llama3</code> &nbsp;← larger (4.7 GB)
-                </li>
-                <li>Ollama starts automatically after install</li>
-              </ol>
+            {/* Backend selector */}
+            <div style={{ display: 'flex', gap: '10px', marginBottom: '16px' }}>
+              <button
+                className={llmBackend === 'ollama' ? 'btn-primary' : 'btn-secondary'}
+                onClick={() => setLlmBackend('ollama')}
+              >
+                🦙 Ollama
+              </button>
+              <button
+                className={llmBackend === 'llamacpp' ? 'btn-primary' : 'btn-secondary'}
+                onClick={() => setLlmBackend('llamacpp')}
+              >
+                ⚡ llama.cpp
+              </button>
             </div>
 
+            {llmBackend === 'ollama' && (
+              <div className="setup-instructions">
+                <h3>Ollama Setup:</h3>
+                <ol>
+                  <li>Download from <a href="https://ollama.ai" target="_blank" rel="noopener noreferrer">ollama.ai</a> and install</li>
+                  <li>Pull a model: <code>ollama pull phi3</code> (3 GB, fast) or <code>ollama pull llama3</code></li>
+                  <li>Ollama runs on <strong>port 11434</strong> automatically after install</li>
+                </ol>
+              </div>
+            )}
+
+            {llmBackend === 'llamacpp' && (
+              <div className="setup-instructions">
+                <h3>llama.cpp Setup:</h3>
+                <ol>
+                  <li>
+                    Download <strong>llama-server</strong> from{' '}
+                    <a href="https://github.com/ggerganov/llama.cpp/releases" target="_blank" rel="noopener noreferrer">
+                      github.com/ggerganov/llama.cpp/releases
+                    </a>{' '}
+                    (pre-built binaries available for macOS / Linux / Windows)
+                  </li>
+                  <li>
+                    Download a GGUF model, e.g.{' '}
+                    <a href="https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf" target="_blank" rel="noopener noreferrer">
+                      Phi-3-mini GGUF
+                    </a>
+                  </li>
+                  <li>
+                    Start server: <code>llama-server -m phi-3-mini.gguf --port 8080</code>
+                  </li>
+                  <li>Server exposes an OpenAI-compatible API on <strong>port 8080</strong></li>
+                </ol>
+              </div>
+            )}
+
             <div style={{ marginBottom: '12px' }}>
-              <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600 }}>
-                Local model name:
-              </label>
+              <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600 }}>Local model name:</label>
               <select
                 value={localModel}
                 onChange={e => { setLocalModel(e.target.value); localStorage.setItem('local_model', e.target.value); }}
@@ -177,17 +223,22 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
 
             <button
               className={`btn-primary ${checkingOllama ? 'loading' : ''}`}
-              onClick={checkOllama}
+              onClick={llmBackend === 'ollama' ? checkOllama : checkLlamaCpp}
               disabled={checkingOllama}
             >
               {checkingOllama ? '🔄 Checking…' : '✓ Check Connection'}
             </button>
 
-            {ollamaConnected && (
+            {llmBackend === 'ollama' && ollamaConnected && (
               <div className="success-message">✅ Ollama is running on localhost:11434!</div>
             )}
+            {llmBackend === 'llamacpp' && llamacppConnected && (
+              <div className="success-message">✅ llama.cpp server is running on localhost:8080!</div>
+            )}
 
-            {ollamaConnected ? (
+            {llmBackend === 'ollama' && ollamaConnected ? (
+              <button className="btn-primary" onClick={handleNext}>Continue →</button>
+            ) : llmBackend === 'llamacpp' && llamacppConnected ? (
               <button className="btn-primary" onClick={handleNext}>Continue →</button>
             ) : (
               <button className="btn-secondary" onClick={handleSkip}>Skip for now</button>
@@ -222,7 +273,7 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
               <pre style={{
                 background: '#111', color: '#0f0', padding: '10px',
                 borderRadius: '6px', fontSize: '12px', whiteSpace: 'pre-wrap',
-                maxHeight: '150px', overflowY: 'auto', marginBottom: '12px'
+                maxHeight: '150px', overflowY: 'auto', marginBottom: '12px',
               }}>
                 {openClawLog}
               </pre>
@@ -241,33 +292,23 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
             <div className="step-icon">🔑</div>
             <h1>Optional: Add External API Key</h1>
             <p>
-              Personaliz works <strong>offline</strong> with local Ollama. Add an API key only if
+              Personaliz works <strong>offline</strong> with a local model. Add an API key only if
               you want cloud models (GPT-4, Claude).
             </p>
             <p style={{ color: '#888', fontSize: '13px', marginBottom: '16px' }}>
-              💡 If no key is set, the app uses your local Ollama model automatically.
+              💡 If no key is set, the app uses your local Ollama or llama.cpp model automatically.
             </p>
 
             <div className="api-info">
               <div className="api-option">
                 <h3>OpenAI (GPT-4)</h3>
                 <p>Get from: <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">platform.openai.com</a></p>
-                <input
-                  type="password"
-                  placeholder="sk-…"
-                  value={openaiKey}
-                  onChange={e => setOpenaiKey(e.target.value)}
-                />
+                <input type="password" placeholder="sk-…" value={openaiKey} onChange={e => setOpenaiKey(e.target.value)} />
               </div>
               <div className="api-option">
                 <h3>Anthropic (Claude)</h3>
                 <p>Get from: <a href="https://console.anthropic.com" target="_blank" rel="noopener noreferrer">console.anthropic.com</a></p>
-                <input
-                  type="password"
-                  placeholder="sk-ant-…"
-                  value={anthropicKey}
-                  onChange={e => setAnthropicKey(e.target.value)}
-                />
+                <input type="password" placeholder="sk-ant-…" value={anthropicKey} onChange={e => setAnthropicKey(e.target.value)} />
               </div>
             </div>
 
@@ -286,9 +327,10 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
             <div className="quick-tips">
               <h3>Quick Tips:</h3>
               <ul>
-                <li>📝 Chat with the assistant to create agents</li>
+                <li>📝 Chat with the assistant to create agents or type <em>"setup"</em> for guided help</li>
                 <li>🤖 Go to <strong>Agents</strong> tab → click <em>Add Demo Agents</em> to create the LinkedIn & hashtag agents instantly</li>
-                <li>📊 Check <strong>Logs</strong> for execution details and run history</li>
+                <li>⏰ Use <strong>Custom (cron)</strong> schedule when creating agents for fine-grained timing</li>
+                <li>📊 Check <strong>Logs</strong> for execution details, approval history, and run history</li>
                 <li>⚙️ Customise settings anytime (sandbox mode, model, API keys)</li>
               </ul>
             </div>

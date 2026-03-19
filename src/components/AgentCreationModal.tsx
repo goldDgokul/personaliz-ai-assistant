@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import '../styles/AgentCreationModal.css';
 
 interface AgentCreationModalProps {
@@ -13,26 +14,29 @@ const AgentCreationModal: React.FC<AgentCreationModalProps> = ({ onClose, onCrea
     role: '',
     goal: '',
     tools: [] as string[],
-    schedule: 'Daily'
+    schedule: 'Daily',
+    cronExpression: '',
   });
+  const [cronError, setCronError] = useState('');
+  const [cronNextRun, setCronNextRun] = useState('');
 
   const tools = ['LinkedIn', 'Twitter', 'Email', 'Browser', 'Web Search', 'Database', 'API', 'Slack'];
-  const schedules = ['Once', 'Hourly', 'Daily', 'Weekly', 'Monthly'];
+  const schedules = ['Once', 'Hourly', 'Daily', 'Weekly', 'Custom (cron)'];
 
   const handleNext = () => {
-    if (step < 4) {
-      setStep(step + 1);
-    }
+    if (step < 4) setStep(step + 1);
   };
 
   const handleBack = () => {
-    if (step > 1) {
-      setStep(step - 1);
-    }
+    if (step > 1) setStep(step - 1);
   };
 
   const handleCreate = () => {
     if (formData.name && formData.role && formData.goal) {
+      if (formData.schedule === 'Custom (cron)' && !formData.cronExpression.trim()) {
+        alert('Please enter a cron expression or select a predefined schedule.');
+        return;
+      }
       onCreate(formData);
     } else {
       alert('Please fill in all required fields');
@@ -44,9 +48,30 @@ const AgentCreationModal: React.FC<AgentCreationModalProps> = ({ onClose, onCrea
       ...prev,
       tools: prev.tools.includes(tool)
         ? prev.tools.filter(t => t !== tool)
-        : [...prev.tools, tool]
+        : [...prev.tools, tool],
     }));
   };
+
+  const validateCron = async (expr: string) => {
+    if (!expr.trim()) {
+      setCronError('');
+      setCronNextRun('');
+      return;
+    }
+    try {
+      const next = await invoke<string>('validate_cron_expression', { cron: expr });
+      setCronError('');
+      setCronNextRun(`Next run: ${new Date(next).toLocaleString()}`);
+    } catch (err) {
+      setCronError(String(err));
+      setCronNextRun('');
+    }
+  };
+
+  const effectiveSchedule =
+    formData.schedule === 'Custom (cron)' && formData.cronExpression
+      ? formData.cronExpression
+      : formData.schedule;
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -67,7 +92,7 @@ const AgentCreationModal: React.FC<AgentCreationModalProps> = ({ onClose, onCrea
                   type="text"
                   placeholder="e.g., LinkedIn Daily Poster"
                   value={formData.name}
-                  onChange={(e) => setFormData({...formData, name: e.target.value})}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                 />
               </div>
               <div className="form-group">
@@ -76,7 +101,7 @@ const AgentCreationModal: React.FC<AgentCreationModalProps> = ({ onClose, onCrea
                   type="text"
                   placeholder="e.g., Content Creator, Marketing Specialist"
                   value={formData.role}
-                  onChange={(e) => setFormData({...formData, role: e.target.value})}
+                  onChange={(e) => setFormData({ ...formData, role: e.target.value })}
                 />
               </div>
             </div>
@@ -92,7 +117,7 @@ const AgentCreationModal: React.FC<AgentCreationModalProps> = ({ onClose, onCrea
                   placeholder="e.g., Post trending topics on LinkedIn every morning"
                   rows={4}
                   value={formData.goal}
-                  onChange={(e) => setFormData({...formData, goal: e.target.value})}
+                  onChange={(e) => setFormData({ ...formData, goal: e.target.value })}
                 />
               </div>
             </div>
@@ -127,29 +152,65 @@ const AgentCreationModal: React.FC<AgentCreationModalProps> = ({ onClose, onCrea
                 <label>Schedule Frequency</label>
                 <select
                   value={formData.schedule}
-                  onChange={(e) => setFormData({...formData, schedule: e.target.value})}
+                  onChange={(e) => {
+                    setFormData({ ...formData, schedule: e.target.value });
+                    setCronError('');
+                    setCronNextRun('');
+                  }}
                 >
                   {schedules.map(sched => (
                     <option key={sched} value={sched}>{sched}</option>
                   ))}
                 </select>
               </div>
+
+              {formData.schedule === 'Custom (cron)' && (
+                <div className="form-group">
+                  <label>
+                    Cron Expression
+                    <span style={{ fontWeight: 400, fontSize: '12px', marginLeft: '8px', color: 'var(--text-secondary)' }}>
+                      (minute hour day month weekday)
+                    </span>
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. 0 9 * * 1-5  →  9 AM weekdays"
+                    value={formData.cronExpression}
+                    onChange={(e) => {
+                      setFormData({ ...formData, cronExpression: e.target.value });
+                      validateCron(e.target.value);
+                    }}
+                    style={{ fontFamily: 'monospace' }}
+                  />
+                  {cronError && (
+                    <p style={{ color: 'var(--error)', fontSize: '12px', marginTop: '4px' }}>
+                      ⚠️ {cronError}
+                    </p>
+                  )}
+                  {cronNextRun && (
+                    <p style={{ color: 'var(--success)', fontSize: '12px', marginTop: '4px' }}>
+                      ✅ {cronNextRun}
+                    </p>
+                  )}
+                  <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+                    Common examples: <code>0 9 * * *</code> (9 AM daily) · <code>0 9 * * 1-5</code> (weekdays) · <code>*/30 * * * *</code> (every 30 min)
+                  </p>
+                </div>
+              )}
+
               <div className="review-section">
                 <h4>Review Your Agent:</h4>
+                <div className="review-item"><strong>Name:</strong> {formData.name}</div>
+                <div className="review-item"><strong>Role:</strong> {formData.role}</div>
+                <div className="review-item"><strong>Goal:</strong> {formData.goal}</div>
+                <div className="review-item"><strong>Tools:</strong> {formData.tools.join(', ') || 'None'}</div>
                 <div className="review-item">
-                  <strong>Name:</strong> {formData.name}
-                </div>
-                <div className="review-item">
-                  <strong>Role:</strong> {formData.role}
-                </div>
-                <div className="review-item">
-                  <strong>Goal:</strong> {formData.goal}
-                </div>
-                <div className="review-item">
-                  <strong>Tools:</strong> {formData.tools.join(', ') || 'None'}
-                </div>
-                <div className="review-item">
-                  <strong>Schedule:</strong> {formData.schedule}
+                  <strong>Schedule:</strong> {effectiveSchedule}
+                  {cronNextRun && (
+                    <span style={{ color: 'var(--success)', marginLeft: '8px', fontSize: '12px' }}>
+                      ({cronNextRun})
+                    </span>
+                  )}
                 </div>
               </div>
             </div>
@@ -157,16 +218,10 @@ const AgentCreationModal: React.FC<AgentCreationModalProps> = ({ onClose, onCrea
         </div>
 
         <div className="modal-footer">
-          <button
-            className="btn-secondary"
-            onClick={handleBack}
-            disabled={step === 1}
-          >
+          <button className="btn-secondary" onClick={handleBack} disabled={step === 1}>
             ← Back
           </button>
-          <div className="step-indicator">
-            Step {step} of 4
-          </div>
+          <div className="step-indicator">Step {step} of 4</div>
           {step === 4 ? (
             <button className="btn-primary" onClick={handleCreate}>
               ✓ Create Agent

@@ -236,9 +236,17 @@ fn get_os_info() -> serde_json::Value {
     })
 }
 
+/// Check if Ollama is listening on port 11434 (500 ms timeout).
 #[tauri::command]
 fn check_ollama_status() -> bool {
-    std::net::TcpStream::connect("127.0.0.1:11434").is_ok()
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+    "127.0.0.1:11434"
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .and_then(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok())
+        .is_some()
 }
 
 #[tauri::command]
@@ -248,17 +256,18 @@ async fn send_message_to_llm(
     model: Option<String>,
     context: Option<String>,
 ) -> Result<String, String> {
-    println!("Sending message to Ollama LLM");
+    println!("Sending message to local LLM");
 
     // Default: llama3 (recommended local model – pull with: ollama pull llama3)
     let selected_model = model.unwrap_or_else(|| "llama3".to_string());
 
     let client = reqwest::Client::new();
+    let system_content = "You are Personaliz Desktop Assistant. You help users set up OpenClaw automation \
+                  without touching command line. Be concise and helpful.";
 
     let mut messages = vec![OllamaMessage {
         role: "system".to_string(),
-        content: "You are Personaliz Desktop Assistant. You help users set up OpenClaw automation \
-                  without touching command line. Be concise and helpful.".to_string(),
+        content: system_content.to_string(),
     }];
 
     messages.extend(history);
@@ -267,32 +276,84 @@ async fn send_message_to_llm(
         content: message,
     });
 
-    let request_body = OllamaRequest {
-        model: selected_model.clone(),
-        messages,
-        stream: false,
+    // Try Ollama first (port 11434), then fall back to llama.cpp-server (port 8080)
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+    let tcp_check = |addr: &str| -> bool {
+        addr.to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+            .and_then(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(500)).ok())
+            .is_some()
     };
+    let ollama_available = tcp_check("127.0.0.1:11434");
+    let llamacpp_available = tcp_check("127.0.0.1:8080");
 
-    match client
-        .post("http://localhost:11434/api/chat")
-        .json(&request_body)
+    if !ollama_available && !llamacpp_available {
+        return Err("No local LLM found. Start Ollama (ollama serve) or llama-server on port 8080.".to_string());
+    }
+
+    let ctx = context.unwrap_or_default();
+
+    if ollama_available {
+        let request_body = OllamaRequest {
+            model: selected_model.clone(),
+            messages,
+            stream: false,
+        };
+
+        match client
+            .post("http://localhost:11434/api/chat")
+            .json(&request_body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<OllamaResponse>().await {
+                    Ok(r) => {
+                        let _ = db::record_llm_usage("ollama", &selected_model, &ctx, &Utc::now().to_rfc3339());
+                        return Ok(r.message.content);
+                    }
+                    Err(e) => return Err(format!("Failed to parse Ollama response: {e}")),
+                }
+            }
+            Ok(response) => return Err(format!("Ollama returned error: {}", response.status())),
+            Err(e) => return Err(format!("Failed to connect to Ollama: {e}")),
+        }
+    }
+
+    // Fallback: llama.cpp server (OpenAI-compatible API on port 8080)
+    let oai_messages: Vec<serde_json::Value> = messages.iter().map(|m| {
+        serde_json::json!({"role": m.role, "content": m.content})
+    }).collect();
+
+    let body = serde_json::json!({
+        "model": selected_model,
+        "messages": oai_messages,
+        "temperature": 0.7,
+        "max_tokens": 500,
+    });
+
+    let resp = client
+        .post("http://localhost:8080/v1/chat/completions")
+        .json(&body)
         .send()
         .await
-    {
-        Ok(response) if response.status().is_success() => {
-            match response.json::<OllamaResponse>().await {
-                Ok(r) => {
-                    // Log LLM usage to SQLite
-                    let ctx = context.unwrap_or_default();
-                    let _ = db::record_llm_usage("ollama", &selected_model, &ctx, &Utc::now().to_rfc3339());
-                    Ok(r.message.content)
-                }
-                Err(e) => Err(format!("Failed to parse LLM response: {e}")),
-            }
-        }
-        Ok(response) => Err(format!("Ollama returned error: {}", response.status())),
-        Err(e) => Err(format!("Failed to connect to Ollama: {e}")),
+        .map_err(|e| format!("Failed to connect to llama.cpp server: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("llama.cpp server returned error: {}", resp.status()));
     }
+
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse llama.cpp response: {e}"))?;
+    let reply = data["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("No response.")
+        .to_string();
+
+    let _ = db::record_llm_usage("llamacpp", &selected_model, &ctx, &Utc::now().to_rfc3339());
+    Ok(reply)
 }
 
 // ============================================================
@@ -596,14 +657,20 @@ fn db_upsert_schedule(
     agent_id: String,
     frequency: String,
     enabled: bool,
+    cron_expression: Option<String>,
 ) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let next_run = scheduler::compute_next_run(&frequency, &now);
+    let next_run = scheduler::compute_next_run_from_schedule(
+        &frequency,
+        cron_expression.as_deref(),
+        &now,
+    );
     let row = db::ScheduleRow {
         id: id.clone(),
         agent_id,
         frequency,
+        cron_expression,
         enabled,
         last_run: None,
         next_run: next_run.to_rfc3339(),
@@ -654,6 +721,129 @@ fn db_get_run_history(
 ) -> Result<Vec<db::RunHistoryRow>, String> {
     db::get_run_history(agent_id.as_deref(), limit.unwrap_or(100))
         .map_err(|e| e.to_string())
+}
+
+// ============================================================
+// DB – Approvals (audit log for human-in-the-loop decisions)
+// ============================================================
+
+#[tauri::command]
+fn db_record_approval(
+    agent_id: String,
+    content_preview: String,
+    outcome: String,
+    notes: Option<String>,
+) -> Result<i64, String> {
+    let decided_at = Utc::now().to_rfc3339();
+    db::record_approval(&agent_id, &content_preview, &outcome, &decided_at, notes.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_list_approvals(
+    agent_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<db::ApprovalRow>, String> {
+    db::list_approvals(agent_id.as_deref(), limit.unwrap_or(100))
+        .map_err(|e| e.to_string())
+}
+
+// ============================================================
+// Cron expression validation helper
+// ============================================================
+
+/// Validate a 5-field cron expression and return the next run time as RFC-3339.
+#[tauri::command]
+fn validate_cron_expression(cron: String) -> Result<String, String> {
+    let now = Utc::now();
+    match scheduler::next_cron_time(&cron, &now) {
+        Some(next) => Ok(next.to_rfc3339()),
+        None => Err(format!("Invalid cron expression: '{cron}'. Expected 5 fields: minute hour day month weekday")),
+    }
+}
+
+// ============================================================
+// llama.cpp server detection
+// ============================================================
+
+/// Check if a llama.cpp server (or any OpenAI-compatible local server) is
+/// listening on port 8080 (the default for llama-server). Uses a 500 ms timeout.
+#[tauri::command]
+fn check_llamacpp_status() -> bool {
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+    "127.0.0.1:8080"
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .and_then(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok())
+        .is_some()
+}
+
+// ============================================================
+// OpenClaw – config file generation
+// ============================================================
+
+/// Generate an OpenClaw agent config file at the given path.
+/// Returns the absolute path of the written file.
+#[tauri::command]
+fn create_openclaw_config(
+    agent_id: String,
+    agent_name: String,
+    role: String,
+    goal: String,
+    tools: Vec<String>,
+    schedule: String,
+    output_dir: Option<String>,
+) -> Result<String, String> {
+    use std::fs;
+
+    let dir_path = match output_dir {
+        Some(d) => std::path::PathBuf::from(d),
+        None => {
+            // Default: ~/.local/share/personaliz-assistant/agents/<agent_id>/
+            let mut p = dirs_or_home();
+            p.push("agents");
+            p.push(&agent_id);
+            p
+        }
+    };
+
+    fs::create_dir_all(&dir_path)
+        .map_err(|e| format!("Cannot create config directory: {e}"))?;
+
+    let config = serde_json::json!({
+        "id": agent_id,
+        "name": agent_name,
+        "role": role,
+        "goal": goal,
+        "tools": tools,
+        "schedule": schedule,
+        "version": "1",
+        "created_at": Utc::now().to_rfc3339(),
+    });
+
+    let config_path = dir_path.join("openclaw.config.json");
+    fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap())
+        .map_err(|e| format!("Cannot write config file: {e}"))?;
+
+    Ok(config_path.to_string_lossy().to_string())
+}
+
+fn dirs_or_home() -> std::path::PathBuf {
+    // ~/.local/share/personaliz-assistant on Linux/macOS, %APPDATA% on Windows
+    if cfg!(target_os = "windows") {
+        std::env::var("APPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("personaliz-assistant")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("personaliz-assistant")
+    }
 }
 
 // ============================================================
@@ -711,6 +901,15 @@ fn main() {
             db_get_logs,
             // DB – run history
             db_get_run_history,
+            // DB – approvals
+            db_record_approval,
+            db_list_approvals,
+            // Cron
+            validate_cron_expression,
+            // llama.cpp
+            check_llamacpp_status,
+            // OpenClaw config
+            create_openclaw_config,
             // DB – heartbeats
             db_upsert_heartbeat,
             db_list_heartbeats,

@@ -973,3 +973,120 @@ body {
   color: var(--text-primary);
   border-color: var(--primary);
 }
+
+/* =========================================================
+   Floating mini-chat overlay (issue #16)
+   ========================================================= */
+
+.floating-chat-overlay {
+  position: fixed;
+  bottom: 80px;
+  right: 20px;
+  width: 340px;
+  max-height: 420px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  z-index: 9998;
+  overflow: hidden;
+  animation: slideUp 0.2s ease-out;
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.floating-chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--surface-light);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.floating-close-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 4px;
+}
+
+.floating-close-btn:hover {
+  color: var(--text-primary);
+}
+
+.floating-chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.floating-msg {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.floating-msg.user {
+  flex-direction: row-reverse;
+}
+
+.floating-msg-avatar {
+  flex-shrink: 0;
+}
+
+.floating-msg-text {
+  background: var(--surface-light);
+  padding: 6px 10px;
+  border-radius: 10px;
+  max-width: 85%;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.floating-msg.user .floating-msg-text {
+  background: var(--primary);
+  color: #fff;
+}
+
+.floating-chat-input {
+  display: flex;
+  border-top: 1px solid var(--border);
+}
+
+.floating-chat-input input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  padding: 10px 14px;
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+}
+
+.floating-chat-input button {
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  padding: 0 16px;
+  cursor: pointer;
+  font-size: 16px;
+  transition: background 0.2s;
+}
+
+.floating-chat-input button:hover {
+  background: var(--primary-dark);
+}

@@ -1,14 +1,23 @@
 import React, { useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 
 interface ApprovalModalProps {
   isOpen: boolean;
   content: string;
+  agentId?: string;
   onApprove: () => void;
   onEdit: (newContent: string) => void;
   onCancel: () => void;
 }
 
-export const ApprovalModal: React.FC<ApprovalModalProps> = ({ isOpen, content, onApprove, onEdit, onCancel }) => {
+export const ApprovalModal: React.FC<ApprovalModalProps> = ({
+  isOpen,
+  content,
+  agentId = 'unknown',
+  onApprove,
+  onEdit,
+  onCancel,
+}) => {
   const [editedContent, setEditedContent] = useState(content);
 
   React.useEffect(() => {
@@ -16,6 +25,26 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({ isOpen, content, o
   }, [content]);
 
   if (!isOpen) return null;
+
+  const recordApproval = (outcome: 'approved' | 'rejected' | 'cancelled') => {
+    const preview = editedContent.slice(0, 200);
+    invoke('db_record_approval', {
+      agentId,
+      contentPreview: preview,
+      outcome,
+      notes: null,
+    }).catch(console.error);
+  };
+
+  const handleApprove = () => {
+    recordApproval('approved');
+    onApprove();
+  };
+
+  const handleCancel = () => {
+    recordApproval('cancelled');
+    onCancel();
+  };
 
   return (
     <div className="approval-modal-overlay">
@@ -37,10 +66,10 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({ isOpen, content, o
         </div>
 
         <div className="approval-modal-footer">
-          <button onClick={onCancel} className="cancel-btn">
+          <button onClick={handleCancel} className="cancel-btn">
             ❌ Discard
           </button>
-          <button onClick={onApprove} className="approve-btn">
+          <button onClick={handleApprove} className="approve-btn">
             ✅ Approve & Execute
           </button>
         </div>

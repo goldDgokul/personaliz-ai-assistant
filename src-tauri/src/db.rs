@@ -3,12 +3,13 @@
 /// Tables
 /// ------
 /// agents          – stored agent definitions
-/// schedules       – when each agent should run (hourly / daily)
+/// schedules       – when each agent should run (hourly / daily / cron)
 /// logs            – append-only execution log
 /// run_history     – one row per agent invocation with result summary
 /// heartbeats      – per-agent heartbeat config (interval, enabled)
 /// heartbeat_runs  – history of heartbeat check outcomes
 /// llm_usage       – log which model/provider was used for each LLM call
+/// approvals       – audit history of human approval decisions
 use rusqlite::{Connection, Result as SqlResult, params};
 use serde::{Deserialize, Serialize};
 use once_cell::sync::Lazy;
@@ -73,13 +74,14 @@ fn init_schema(conn: &Connection) -> SqlResult<()> {
         );
 
         CREATE TABLE IF NOT EXISTS schedules (
-            id          TEXT PRIMARY KEY,
-            agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-            frequency   TEXT NOT NULL,  -- 'hourly' | 'daily' | 'weekly' | 'once'
-            enabled     INTEGER NOT NULL DEFAULT 1,
-            last_run    TEXT,
-            next_run    TEXT NOT NULL,
-            created_at  TEXT NOT NULL
+            id              TEXT PRIMARY KEY,
+            agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            frequency       TEXT NOT NULL,  -- 'hourly' | 'daily' | 'weekly' | 'once' | 'cron'
+            cron_expression TEXT,           -- 5-field cron e.g. "0 9 * * 1-5"
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            last_run        TEXT,
+            next_run        TEXT NOT NULL,
+            created_at      TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS logs (
@@ -123,6 +125,15 @@ fn init_schema(conn: &Connection) -> SqlResult<()> {
             context    TEXT NOT NULL DEFAULT '',
             timestamp  TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS approvals (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id        TEXT NOT NULL,
+            content_preview TEXT NOT NULL,
+            outcome         TEXT NOT NULL,  -- 'approved' | 'rejected' | 'cancelled'
+            decided_at      TEXT NOT NULL,
+            notes           TEXT
+        );
         "#,
     )
 }
@@ -147,6 +158,7 @@ pub struct ScheduleRow {
     pub id: String,
     pub agent_id: String,
     pub frequency: String,
+    pub cron_expression: Option<String>,
     pub enabled: bool,
     pub last_run: Option<String>,
     pub next_run: String,
@@ -264,14 +276,15 @@ pub fn update_agent_status(id: &str, status: &str) -> SqlResult<()> {
 pub fn upsert_schedule(s: &ScheduleRow) -> SqlResult<()> {
     let db = DB.lock().unwrap();
     db.execute(
-        "INSERT INTO schedules (id, agent_id, frequency, enabled, last_run, next_run, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO schedules (id, agent_id, frequency, cron_expression, enabled, last_run, next_run, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET
            frequency=excluded.frequency,
+           cron_expression=excluded.cron_expression,
            enabled=excluded.enabled,
            next_run=excluded.next_run",
         params![
-            s.id, s.agent_id, s.frequency,
+            s.id, s.agent_id, s.frequency, s.cron_expression,
             s.enabled as i32,
             s.last_run, s.next_run, s.created_at
         ],
@@ -282,7 +295,7 @@ pub fn upsert_schedule(s: &ScheduleRow) -> SqlResult<()> {
 pub fn list_schedules() -> SqlResult<Vec<ScheduleRow>> {
     let db = DB.lock().unwrap();
     let mut stmt = db.prepare(
-        "SELECT id, agent_id, frequency, enabled, last_run, next_run, created_at
+        "SELECT id, agent_id, frequency, cron_expression, enabled, last_run, next_run, created_at
          FROM schedules ORDER BY next_run",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -290,10 +303,11 @@ pub fn list_schedules() -> SqlResult<Vec<ScheduleRow>> {
             id: row.get(0)?,
             agent_id: row.get(1)?,
             frequency: row.get(2)?,
-            enabled: row.get::<_, i32>(3)? != 0,
-            last_run: row.get(4)?,
-            next_run: row.get(5)?,
-            created_at: row.get(6)?,
+            cron_expression: row.get(3)?,
+            enabled: row.get::<_, i32>(4)? != 0,
+            last_run: row.get(5)?,
+            next_run: row.get(6)?,
+            created_at: row.get(7)?,
         })
     })?;
     rows.collect()
@@ -559,7 +573,80 @@ pub fn get_llm_usage(limit: usize) -> SqlResult<Vec<LlmUsageRow>> {
     rows.collect()
 }
 
+// ---------------------------------------------------------------------------
+// Approvals
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ApprovalRow {
+    pub id: i64,
+    pub agent_id: String,
+    pub content_preview: String,
+    pub outcome: String,
+    pub decided_at: String,
+    pub notes: Option<String>,
+}
+
+pub fn record_approval(
+    agent_id: &str,
+    content_preview: &str,
+    outcome: &str,
+    decided_at: &str,
+    notes: Option<&str>,
+) -> SqlResult<i64> {
+    let db = DB.lock().unwrap();
+    db.execute(
+        "INSERT INTO approvals (agent_id, content_preview, outcome, decided_at, notes)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![agent_id, content_preview, outcome, decided_at, notes],
+    )?;
+    Ok(db.last_insert_rowid())
+}
+
+pub fn list_approvals(agent_id: Option<&str>, limit: usize) -> SqlResult<Vec<ApprovalRow>> {
+    let db = DB.lock().unwrap();
+    if let Some(aid) = agent_id {
+        let mut stmt = db.prepare(
+            "SELECT id, agent_id, content_preview, outcome, decided_at, notes
+             FROM approvals WHERE agent_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![aid, limit as i64], |row| {
+            Ok(ApprovalRow {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                content_preview: row.get(2)?,
+                outcome: row.get(3)?,
+                decided_at: row.get(4)?,
+                notes: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    } else {
+        let mut stmt = db.prepare(
+            "SELECT id, agent_id, content_preview, outcome, decided_at, notes
+             FROM approvals ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(ApprovalRow {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                content_preview: row.get(2)?,
+                outcome: row.get(3)?,
+                decided_at: row.get(4)?,
+                notes: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
 /// Ensure the database is initialised (call once at startup).
 pub fn init() {
     Lazy::force(&DB);
+    // Migrate: add new columns to existing databases gracefully
+    if let Ok(db) = DB.lock() {
+        // cron_expression column was added in v0.3 – safe to ignore error if already present
+        let _ = db.execute_batch("ALTER TABLE schedules ADD COLUMN cron_expression TEXT;");
+        // approvals table is created in init_schema; nothing to migrate
+    }
 }

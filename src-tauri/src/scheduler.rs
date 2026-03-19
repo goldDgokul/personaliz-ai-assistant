@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
-use chrono::{DateTime, Utc, Duration as ChronoDuration};
+use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc, Duration as ChronoDuration};
 
 use crate::db;
 
@@ -77,14 +77,32 @@ fn run_due_schedules(agent_engine_path: &PathBuf) {
             &finished_at,
         );
 
-        // Compute next_run
-        let next = compute_next_run(&schedule.frequency, &now);
+        // Compute next_run based on frequency or cron expression
+        let next = compute_next_run_from_schedule(&schedule.frequency, schedule.cron_expression.as_deref(), &now);
         let _ = db::update_schedule_run(
             &schedule.id,
             &started_at,
             &next.to_rfc3339(),
         );
     }
+}
+
+/// Compute the next run time given a frequency string and optional cron expression.
+/// If a cron expression is present and valid, it takes precedence.
+pub fn compute_next_run_from_schedule(
+    frequency: &str,
+    cron_expression: Option<&str>,
+    from: &DateTime<Utc>,
+) -> DateTime<Utc> {
+    if let Some(expr) = cron_expression {
+        if !expr.is_empty() {
+            if let Some(next) = next_cron_time(expr, from) {
+                return next;
+            }
+            eprintln!("[scheduler] Invalid cron expression {:?}; falling back to frequency", expr);
+        }
+    }
+    compute_next_run(frequency, from)
 }
 
 /// Compute the next run time given a frequency string.
@@ -95,6 +113,128 @@ pub fn compute_next_run(frequency: &str, from: &DateTime<Utc>) -> DateTime<Utc> 
         "weekly" => *from + ChronoDuration::weeks(1),
         _ => *from + ChronoDuration::hours(24),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cron expression parser
+// ---------------------------------------------------------------------------
+
+/// Parse a single cron field into the set of matching values.
+///
+/// Supports: `*`, `n`, `*/step`, `n-m`, `n,m,…` (and combinations).
+pub fn parse_cron_field(s: &str, min: u8, max: u8) -> Option<Vec<u8>> {
+    let mut result = Vec::new();
+
+    for part in s.split(',') {
+        if part == "*" {
+            for v in min..=max {
+                result.push(v);
+            }
+        } else if let Some(step_str) = part.strip_prefix("*/") {
+            let step: u8 = step_str.parse().ok()?;
+            if step == 0 {
+                return None;
+            }
+            let mut v = min;
+            while v <= max {
+                result.push(v);
+                v = v.saturating_add(step);
+            }
+        } else if let Some(dash_pos) = part.find('-') {
+            let lo: u8 = part[..dash_pos].parse().ok()?;
+            let hi: u8 = part[dash_pos + 1..].parse().ok()?;
+            if lo > hi {
+                return None;
+            }
+            for v in lo..=hi {
+                result.push(v);
+            }
+        } else {
+            let v: u8 = part.parse().ok()?;
+            if v < min || v > max {
+                return None;
+            }
+            result.push(v);
+        }
+    }
+
+    result.sort_unstable();
+    result.dedup();
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// Compute the next datetime that matches the given 5-field cron expression.
+///
+/// Field order: `minute hour day-of-month month day-of-week`
+///
+/// Returns `None` if the expression is invalid or no match is found within 1 year.
+pub fn next_cron_time(cron: &str, from: &DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let fields: Vec<&str> = cron.trim().split_whitespace().collect();
+    if fields.len() != 5 {
+        return None;
+    }
+
+    let mins_set = parse_cron_field(fields[0], 0, 59)?;
+    let hrs_set = parse_cron_field(fields[1], 0, 23)?;
+    let doms_set = parse_cron_field(fields[2], 1, 31)?;
+    let months_set = parse_cron_field(fields[3], 1, 12)?;
+    let dows_set = parse_cron_field(fields[4], 0, 6)?;
+
+    let dom_restricted = fields[2] != "*";
+    let dow_restricted = fields[4] != "*";
+
+    // Advance by at least 1 minute and truncate to minute precision
+    let start_naive = (from.naive_utc() + ChronoDuration::minutes(1))
+        .with_second(0)
+        .and_then(|dt| dt.with_nanosecond(0))?;
+    let mut dt = DateTime::<Utc>::from_naive_utc_and_offset(start_naive, Utc);
+
+    let limit = *from + ChronoDuration::days(366);
+
+    while dt <= limit {
+        let month = dt.month() as u8;
+        let dom = dt.day() as u8;
+        let dow = dt.weekday().num_days_from_sunday() as u8;
+        let hour = dt.hour() as u8;
+        let min = dt.minute() as u8;
+
+        if !months_set.contains(&month) {
+            dt = dt + ChronoDuration::minutes(1);
+            continue;
+        }
+
+        let day_ok = if dom_restricted && dow_restricted {
+            doms_set.contains(&dom) || dows_set.contains(&dow)
+        } else if dom_restricted {
+            doms_set.contains(&dom)
+        } else if dow_restricted {
+            dows_set.contains(&dow)
+        } else {
+            true
+        };
+
+        if !day_ok {
+            dt = dt + ChronoDuration::minutes(1);
+            continue;
+        }
+
+        if !hrs_set.contains(&hour) {
+            dt = dt + ChronoDuration::minutes(1);
+            continue;
+        }
+
+        if mins_set.contains(&min) {
+            return Some(dt);
+        }
+
+        dt = dt + ChronoDuration::minutes(1);
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -139,6 +279,111 @@ mod tests {
         let from = base_time();
         assert_eq!(compute_next_run("HOURLY", &from), compute_next_run("hourly", &from));
         assert_eq!(compute_next_run("Daily", &from), compute_next_run("daily", &from));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cron field parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_cron_field_star() {
+        let v = parse_cron_field("*", 0, 5).unwrap();
+        assert_eq!(v, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_parse_cron_field_exact() {
+        let v = parse_cron_field("3", 0, 59).unwrap();
+        assert_eq!(v, vec![3]);
+    }
+
+    #[test]
+    fn test_parse_cron_field_step() {
+        let v = parse_cron_field("*/15", 0, 59).unwrap();
+        assert_eq!(v, vec![0, 15, 30, 45]);
+    }
+
+    #[test]
+    fn test_parse_cron_field_range() {
+        let v = parse_cron_field("1-3", 0, 6).unwrap();
+        assert_eq!(v, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_parse_cron_field_list() {
+        let v = parse_cron_field("0,15,30,45", 0, 59).unwrap();
+        assert_eq!(v, vec![0, 15, 30, 45]);
+    }
+
+    #[test]
+    fn test_parse_cron_field_zero_step_invalid() {
+        assert!(parse_cron_field("*/0", 0, 59).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cron next-time tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_next_cron_time_every_minute() {
+        let from = base_time(); // 2024-01-01 12:00:00
+        let next = next_cron_time("* * * * *", &from).unwrap();
+        assert_eq!(next, from + ChronoDuration::minutes(1));
+    }
+
+    #[test]
+    fn test_next_cron_time_daily_9am() {
+        // "0 9 * * *" from 12:00 should give next day 09:00
+        let from = base_time(); // 12:00
+        let next = next_cron_time("0 9 * * *", &from).unwrap();
+        let expected = Utc.with_ymd_and_hms(2024, 1, 2, 9, 0, 0).unwrap();
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_next_cron_time_before_trigger_same_day() {
+        // "0 15 * * *" from 12:00 should fire same day at 15:00
+        let from = base_time(); // 12:00
+        let next = next_cron_time("0 15 * * *", &from).unwrap();
+        let expected = Utc.with_ymd_and_hms(2024, 1, 1, 15, 0, 0).unwrap();
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_next_cron_time_every_15_min() {
+        let from = Utc.with_ymd_and_hms(2024, 1, 1, 12, 7, 0).unwrap();
+        let next = next_cron_time("*/15 * * * *", &from).unwrap();
+        let expected = Utc.with_ymd_and_hms(2024, 1, 1, 12, 15, 0).unwrap();
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_next_cron_time_invalid_returns_none() {
+        let from = base_time();
+        assert!(next_cron_time("bad expression", &from).is_none());
+        assert!(next_cron_time("* * * *", &from).is_none()); // only 4 fields
+    }
+
+    #[test]
+    fn test_compute_next_run_from_schedule_uses_cron_when_present() {
+        let from = base_time(); // 12:00
+        let next = compute_next_run_from_schedule("daily", Some("0 15 * * *"), &from);
+        let expected = Utc.with_ymd_and_hms(2024, 1, 1, 15, 0, 0).unwrap();
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_compute_next_run_from_schedule_falls_back_on_invalid_cron() {
+        let from = base_time();
+        let next = compute_next_run_from_schedule("hourly", Some("not valid"), &from);
+        assert_eq!(next, from + ChronoDuration::hours(1));
+    }
+
+    #[test]
+    fn test_compute_next_run_from_schedule_uses_frequency_when_no_cron() {
+        let from = base_time();
+        let next = compute_next_run_from_schedule("hourly", None, &from);
+        assert_eq!(next, from + ChronoDuration::hours(1));
     }
 }
 
@@ -239,3 +484,4 @@ fn run_due_heartbeats() {
         );
     }
 }
+

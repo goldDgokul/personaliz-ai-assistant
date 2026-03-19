@@ -72,6 +72,15 @@ interface LlmUsageRow {
   timestamp: string;
 }
 
+interface ApprovalRow {
+  id: number;
+  agent_id: string;
+  content_preview: string;
+  outcome: string;
+  decided_at: string;
+  notes: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
@@ -93,8 +102,14 @@ function App() {
   const [heartbeats, setHeartbeats] = useState<HeartbeatRow[]>([]);
   const [heartbeatRuns, setHeartbeatRuns] = useState<HeartbeatRunRow[]>([]);
   const [llmUsage, setLlmUsage] = useState<LlmUsageRow[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalRow[]>([]);
 
-  // Floating assistant icon state
+  // Floating mini-chat overlay (visible on any tab)
+  const [isFloatingChatOpen, setIsFloatingChatOpen] = useState(false);
+  const [floatingInput, setFloatingInput] = useState('');
+  const floatingMessagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Floating assistant icon state (legacy toggle, kept for backward compat)
   const [isChatOpen, setIsChatOpen] = useState(true);
 
   // Approval modal
@@ -185,6 +200,11 @@ function App() {
     try {
       const usage = await invoke<LlmUsageRow[]>('db_get_llm_usage', { limit: 50 });
       setLlmUsage(usage);
+    } catch (_) {}
+
+    try {
+      const approvs = await invoke<ApprovalRow[]>('db_list_approvals', { limit: 100 });
+      setApprovals(approvs);
     } catch (_) {}
   };
 
@@ -341,10 +361,10 @@ Keep responses concise (2-3 sentences max).`;
     return data.choices?.[0]?.message?.content || 'No response.';
   };
 
-  const handleSendMessage = async () => {
-    if (!inputValue.trim()) return;
-    const userMessage = inputValue;
-    setInputValue('');
+  const handleSendMessage = async (overrideMessage?: string) => {
+    const userMessage = overrideMessage ?? inputValue;
+    if (!userMessage.trim()) return;
+    if (!overrideMessage) setInputValue('');
     setIsLoading(true);
 
     setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
@@ -368,11 +388,28 @@ Keep responses concise (2-3 sentences max).`;
       setMessages(prev => [...prev, { role: 'assistant', content: response }]);
 
       const lower = userMessage.toLowerCase();
-      if (
-        lower.includes('create agent') || lower.includes('new agent') ||
-        lower.includes('linkedin') || lower.includes('trending')
-      ) {
-        setTimeout(() => setShowAgentModal(true), 500);
+
+      // Chat-driven onboarding (issue #20)
+      if (lower === 'setup' || lower === '/setup' || lower.includes('help me set up')) {
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `Sure! Here's a quick setup guide:\n\n1. **Local AI**: Install Ollama from ollama.ai and run \`ollama pull phi3\`. Or start llama-server on port 8080 for llama.cpp.\n2. **OpenClaw**: Run \`npm install -g openclaw\` (Node.js 18+ required).\n3. **API keys** (optional): Add OpenAI or Anthropic key in ⚙️ Settings for cloud models.\n4. **Demo agents**: Say "add demo agents" to create the LinkedIn automation agents instantly.\n\nType "add demo agents" to get started right away!`,
+        }]);
+        return;
+      }
+
+      // Agent creation via chat with config preview (issue #19)
+      if (lower.includes('create agent') || lower.includes('new agent') ||
+          lower.includes('linkedin') || lower.includes('trending') ||
+          lower.includes('make an agent') || lower.includes('build an agent')) {
+        // Show a config preview snippet in chat before opening modal
+        const nameHint = lower.includes('linkedin') ? 'LinkedIn Automation' :
+                         lower.includes('trending') ? 'Trending Poster' : 'Custom Agent';
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `🔧 I'll help you create a new agent! Here's a preview of what we'll configure:\n\n\`\`\`json\n{\n  "name": "${nameHint}",\n  "role": "...",\n  "goal": "...",\n  "tools": [],\n  "schedule": "Daily"\n}\n\`\`\`\n\nOpening the agent creation wizard…`,
+        }]);
+        setTimeout(() => setShowAgentModal(true), 800);
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -419,9 +456,33 @@ Keep responses concise (2-3 sentences max).`;
     setAgents(prev => [...prev, newAgent]);
     persistAgent(newAgent);
     addLog(newAgent.id, 'success', `Agent "${newAgent.name}" created`);
+
+    // Generate OpenClaw config file (issues #19 + #21)
+    const rawCron = agentData.cronExpression?.trim();
+    const cronExpr: string | undefined = rawCron || undefined;
+    invoke('create_openclaw_config', {
+      agentId: newAgent.id,
+      agentName: newAgent.name,
+      role: newAgent.role,
+      goal: newAgent.goal,
+      tools: newAgent.tools,
+      schedule: cronExpr ?? newAgent.schedule,
+      outputDir: null,
+    }).then((p) => {
+      addLog(newAgent.id, 'info', `OpenClaw config written: ${p}`);
+    }).catch(() => {});
+
+    // Schedule in DB (issue #18)
+    invoke('db_upsert_schedule', {
+      agentId: newAgent.id,
+      frequency: newAgent.schedule.toLowerCase(),
+      enabled: true,
+      cronExpression: cronExpr ?? null,
+    }).catch(() => {});
+
     setMessages(prev => [...prev, {
       role: 'assistant',
-      content: `✅ Created agent "${newAgent.name}"!\n\nRole: ${newAgent.role}\nGoal: ${newAgent.goal}\nSchedule: ${newAgent.schedule}\n\nHead to the Agents tab to run it!`,
+      content: `✅ Created agent "${newAgent.name}"!\n\nRole: ${newAgent.role}\nGoal: ${newAgent.goal}\nSchedule: ${agentData.schedule ?? newAgent.schedule}${cronExpr ? ` (cron: ${cronExpr})` : ''}\n\nHead to the Agents tab to run it!`,
     }]);
     setShowAgentModal(false);
   };
@@ -466,6 +527,7 @@ Keep responses concise (2-3 sentences max).`;
           agentId: a.id,
           frequency: a.schedule.toLowerCase(),
           enabled: true,
+          cronExpression: null,
         });
       } catch (_) {}
     }
@@ -582,6 +644,14 @@ Keep responses concise (2-3 sentences max).`;
     addLog(pendingAgentId, 'success', '✅ Content approved by user');
     setAgents(prev => prev.map(a => a.id === pendingAgentId ? { ...a, status: 'running' } : a));
 
+    // Refresh approvals after the modal records it
+    setTimeout(async () => {
+      try {
+        const approvs = await invoke<ApprovalRow[]>('db_list_approvals', { limit: 100 });
+        setApprovals(approvs);
+      } catch (_) {}
+    }, 300);
+
     try {
       addLog(pendingAgentId, 'info', '🌐 Launching LinkedIn automation…');
       const result = await invoke<string>('post_to_linkedin', {
@@ -616,6 +686,13 @@ Keep responses concise (2-3 sentences max).`;
     setShowApprovalModal(false);
     setPendingContent('');
     setPendingAgentId(null);
+    // Refresh approvals
+    setTimeout(async () => {
+      try {
+        const approvs = await invoke<ApprovalRow[]>('db_list_approvals', { limit: 100 });
+        setApprovals(approvs);
+      } catch (_) {}
+    }, 300);
   };
 
   // -------------------------------------------------------------------------
@@ -947,6 +1024,30 @@ Perfect for non-technical users who want to automate their workflows!
               </div>
             )}
 
+            {/* Approvals Audit Log (issue #14) */}
+            {approvals.length > 0 && (
+              <div style={{ marginTop: '32px' }}>
+                <h3 style={{ marginBottom: '12px' }}>✅ Approval Audit Log</h3>
+                <div className="logs-list">
+                  {approvals.slice(0, 30).map(a => (
+                    <div
+                      key={a.id}
+                      className={`log-entry ${a.outcome === 'approved' ? 'success' : a.outcome === 'rejected' ? 'error' : 'warning'}`}
+                    >
+                      <span className="log-time">{fmtTs(a.decided_at)}</span>
+                      <span className={`log-level ${a.outcome === 'approved' ? 'success' : a.outcome === 'cancelled' ? 'warning' : 'error'}`}>
+                        [{a.outcome.toUpperCase()}]
+                      </span>
+                      <span className="log-message">
+                        Agent {a.agent_id.slice(-8)} – {a.content_preview.slice(0, 80)}
+                        {a.notes ? ` (${a.notes})` : ''}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* LLM Usage Log */}
             {llmUsage.length > 0 && (
               <div style={{ marginTop: '32px' }}>
@@ -957,7 +1058,7 @@ Perfect for non-technical users who want to automate their workflows!
                       <span className="log-time">{fmtTs(u.timestamp)}</span>
                       <span className="log-level info">[LLM]</span>
                       <span className="log-message">
-                        {u.provider === 'ollama' ? '🏠' : '🔑'} {u.provider} / {u.model}
+                        {u.provider === 'ollama' ? '🏠' : u.provider === 'llamacpp' ? '⚡' : '🔑'} {u.provider} / {u.model}
                         {u.context && ` (${u.context})`}
                       </span>
                     </div>
@@ -1112,22 +1213,74 @@ Perfect for non-technical users who want to automate their workflows!
       <ApprovalModal
         isOpen={showApprovalModal}
         content={pendingContent}
+        agentId={pendingAgentId ?? undefined}
         onApprove={handleApprove}
         onEdit={setPendingContent}
         onCancel={handleCancel}
       />
 
+      {/* Floating mini-chat overlay (issue #16) – visible on all tabs except chat */}
+      {isFloatingChatOpen && activeTab !== 'chat' && (
+        <div className="floating-chat-overlay">
+          <div className="floating-chat-header">
+            <span>🤖 Quick Chat</span>
+            <button onClick={() => setIsFloatingChatOpen(false)} className="floating-close-btn">✕</button>
+          </div>
+          <div className="floating-chat-messages">
+            {messages.slice(-6).map((msg, idx) => (
+              <div key={idx} className={`floating-msg ${msg.role}`}>
+                <span className="floating-msg-avatar">{msg.role === 'user' ? '👤' : '🤖'}</span>
+                <span className="floating-msg-text">{msg.content.slice(0, 200)}{msg.content.length > 200 ? '…' : ''}</span>
+              </div>
+            ))}
+            <div ref={floatingMessagesEndRef} />
+          </div>
+          <div className="floating-chat-input">
+            <input
+              type="text"
+              value={floatingInput}
+              onChange={e => setFloatingInput(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && floatingInput.trim()) {
+                  const msg = floatingInput;
+                  setFloatingInput('');
+                  setIsFloatingChatOpen(false);
+                  setActiveTab('chat');
+                  handleSendMessage(msg);
+                }
+              }}
+              placeholder="Ask anything…"
+            />
+            <button
+              onClick={() => {
+                if (!floatingInput.trim()) return;
+                const msg = floatingInput;
+                setFloatingInput('');
+                setIsFloatingChatOpen(false);
+                setActiveTab('chat');
+                handleSendMessage(msg);
+              }}
+            >
+              →
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Floating Assistant Icon – always visible */}
       <button
         className={`floating-assistant-btn ${isChatOpen ? 'open' : ''}`}
-        title={isChatOpen ? 'Minimize chat' : 'Open chat'}
+        title={activeTab !== 'chat' && isFloatingChatOpen ? 'Close mini chat' : activeTab !== 'chat' ? 'Open mini chat' : isChatOpen ? 'Minimize chat' : 'Open chat'}
         onClick={() => {
-          setIsChatOpen(prev => !prev);
-          if (!isChatOpen) setActiveTab('chat');
+          if (activeTab !== 'chat') {
+            setIsFloatingChatOpen(prev => !prev);
+          } else {
+            setIsChatOpen(prev => !prev);
+          }
         }}
         aria-label="Toggle chat panel"
       >
-        {isChatOpen ? '✕' : '🤖'}
+        {activeTab !== 'chat' && isFloatingChatOpen ? '✕' : '🤖'}
       </button>
     </div>
   );

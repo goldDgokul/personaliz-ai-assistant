@@ -29,6 +29,8 @@ A UI-first desktop automation assistant powered by **local AI (Llama 3 / Phi-3)*
 
 ## 🚀 Quick Start
 
+> 📖 **Need the full platform-specific guide?** See **[SETUP.md](./SETUP.md)** for copy-pasteable instructions covering Windows, macOS, and Linux from scratch.
+
 ### Prerequisites
 
 | Tool | Install | Required? |
@@ -38,6 +40,7 @@ A UI-first desktop automation assistant powered by **local AI (Llama 3 / Phi-3)*
 | **Ollama** _or_ **llama.cpp** | see below | One of the two (or use cloud API key) |
 | Python 3.9+ | https://python.org | For LinkedIn automation |
 | Playwright | `pip install playwright && playwright install chromium` | For LinkedIn automation |
+| OpenClaw CLI | `npm install -g openclaw` | For agent execution |
 
 ### 1. Clone & install
 
@@ -55,6 +58,7 @@ npm install
 # Install Ollama from https://ollama.ai then pull a model:
 ollama pull phi3        # 3 GB – fast and recommended
 ollama pull llama3      # 4.7 GB – larger, higher quality
+ollama serve            # start the API on http://localhost:11434
 ```
 
 Ollama exposes an API on **port 11434** automatically after installation.
@@ -71,11 +75,28 @@ Ollama exposes an API on **port 11434** automatically after installation.
 
 The onboarding wizard (Step 2) lets you select between Ollama and llama.cpp and tests the connection for you.
 
-### 3. Run in development mode
+### 3. Install OpenClaw
+
+```bash
+npm install -g openclaw
+```
+
+The onboarding wizard can also install this automatically at Step 3.
+
+### 4. Install Python automation dependencies
+
+```bash
+pip3 install playwright
+playwright install chromium
+```
+
+### 5. Run in development mode
 
 ```bash
 npm run tauri dev
 ```
+
+> ⚠️ The **first Rust compilation** takes 3–10 minutes. Subsequent runs use a cache and start in ~10 seconds.
 
 The onboarding wizard guides you through the rest (LLM check, OpenClaw install, optional API keys).
 

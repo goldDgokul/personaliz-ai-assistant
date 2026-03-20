@@ -17,6 +17,7 @@ pub fn start(agent_engine_path: PathBuf) {
             tokio::time::sleep(Duration::from_secs(60)).await;
             run_due_schedules(&agent_engine_path);
             run_due_heartbeats();
+            run_due_event_triggers(&agent_engine_path);
         }
     });
 }
@@ -421,7 +422,192 @@ fn execute_agent_python(
     }
 }
 
-/// Poll heartbeat configs and record outcomes for any that are due.
+/// Poll event triggers and fire agents for any that are due.
+/// Uses a simple HTTP GET to check the target URL for keyword matches or content changes.
+fn run_due_event_triggers(agent_engine_path: &PathBuf) {
+    let now = Utc::now();
+    let triggers = match db::list_event_triggers() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[scheduler] Cannot read event_triggers: {e}");
+            return;
+        }
+    };
+
+    for trigger in triggers {
+        if !trigger.enabled {
+            continue;
+        }
+
+        // Determine if check interval has elapsed
+        let due = match &trigger.last_checked {
+            None => true,
+            Some(last) => match last.parse::<DateTime<Utc>>() {
+                Ok(dt) => now >= dt + ChronoDuration::minutes(trigger.check_interval_min),
+                Err(_) => true,
+            },
+        };
+
+        if !due {
+            continue;
+        }
+
+        eprintln!(
+            "[scheduler] Checking event trigger {} ({}) for agent {}",
+            trigger.id, trigger.trigger_type, trigger.agent_id
+        );
+
+        let checked_at = now.to_rfc3339();
+        let (fired, matched_content) = check_event_trigger(&trigger);
+
+        let new_hash: Option<String> = if trigger.trigger_type == "url_change" {
+            matched_content.clone()
+        } else {
+            trigger.last_hash.clone()
+        };
+
+        let _ = db::update_event_trigger_checked(&trigger.id, &checked_at, new_hash.as_deref());
+
+        if fired {
+            eprintln!(
+                "[scheduler] Event trigger {} fired for agent {}! Content: {:?}",
+                trigger.id, trigger.agent_id, matched_content
+            );
+
+            let _ = db::record_event_history(
+                &trigger.id,
+                &trigger.agent_id,
+                &checked_at,
+                matched_content.as_deref(),
+                "fired",
+            );
+
+            // Run the agent
+            let started_at = now.to_rfc3339();
+            let run_id = db::start_run(&trigger.agent_id, &started_at).unwrap_or(-1);
+            let (status, result_msg) = execute_agent_python(agent_engine_path, &trigger.agent_id, true);
+            let finished_at = Utc::now().to_rfc3339();
+            if run_id >= 0 {
+                let _ = db::finish_run(run_id, &finished_at, &status, &result_msg);
+            }
+            let _ = db::append_log(
+                &trigger.agent_id,
+                if status == "success" { "success" } else { "error" },
+                &format!("[EventTrigger] {result_msg}"),
+                &finished_at,
+            );
+        }
+    }
+}
+
+/// Check a single event trigger. Returns (fired, optional_matched_content).
+fn check_event_trigger(trigger: &db::EventTriggerRow) -> (bool, Option<String>) {
+    // Use a simple blocking TCP connection to avoid bringing in async reqwest here.
+    // We parse the URL and do a minimal HTTP/1.1 GET over std::net::TcpStream.
+    let body = match fetch_url_body(&trigger.target_url) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[scheduler] Event trigger {} fetch error: {e}", trigger.id);
+            return (false, None);
+        }
+    };
+
+    match trigger.trigger_type.as_str() {
+        "keyword_found" => {
+            if let Some(kw) = &trigger.keyword {
+                let found = body.to_lowercase().contains(&kw.to_lowercase());
+                if found {
+                    return (true, Some(format!("Keyword '{}' found in {}", kw, trigger.target_url)));
+                }
+            }
+            (false, None)
+        }
+        "url_change" => {
+            // Use a hash of the body to detect changes
+            let hash = format!("{:x}", fnv1a_hash(&body));
+            let changed = trigger.last_hash.as_deref() != Some(&hash);
+            if changed && trigger.last_hash.is_some() {
+                (true, Some(hash))
+            } else {
+                // First check or no change — store hash but don't fire
+                (false, Some(hash))
+            }
+        }
+        "new_post" => {
+            // Simple heuristic: look for common RSS/feed item indicators
+            let item_count = body.matches("<item>").count() + body.matches("\"entry\"").count();
+            if item_count > 0 {
+                let hash = format!("{:x}", fnv1a_hash(&body));
+                let changed = trigger.last_hash.as_deref() != Some(&hash);
+                if changed && trigger.last_hash.is_some() {
+                    return (true, Some(format!("New content detected ({item_count} items) at {}", trigger.target_url)));
+                }
+                (false, Some(hash))
+            } else {
+                (false, None)
+            }
+        }
+        _ => (false, None),
+    }
+}
+
+/// FNV-1a 64-bit hash used for content-change detection (no external crate needed).
+fn fnv1a_hash(s: &str) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
+
+/// Minimal synchronous HTTP GET that returns the response body as a String.
+/// Only supports http:// (not https://).  Returns an error for https:// URLs.
+fn fetch_url_body(url: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let url = url.trim();
+
+    let (host, path) = if let Some(rest) = url.strip_prefix("http://") {
+        let slash_pos = rest.find('/').unwrap_or(rest.len());
+        (rest[..slash_pos].to_string(), rest[slash_pos..].to_string())
+    } else if url.starts_with("https://") {
+        // TLS requires an external dependency that is not bundled.
+        // Users should either use an http:// URL or implement a custom polling solution.
+        return Err("https:// URLs require TLS support which is not available in the built-in poller. Use http:// URLs instead.".to_string());
+    } else {
+        return Err(format!("Unsupported URL scheme: {url}"));
+    };
+
+    let host_port = if host.contains(':') {
+        host.clone()
+    } else {
+        format!("{host}:80")
+    };
+
+    let path = if path.is_empty() { "/".to_string() } else { path };
+
+    let mut stream = TcpStream::connect(&host_port)
+        .map_err(|e| format!("Cannot connect to {host_port}: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+
+    let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).map_err(|e| e.to_string())?;
+
+    // Strip HTTP headers
+    if let Some(body_start) = response.find("\r\n\r\n") {
+        Ok(response[body_start + 4..].to_string())
+    } else {
+        Ok(response)
+    }
+}
+
+
 fn run_due_heartbeats() {
     let now = Utc::now();
     let heartbeats = match db::list_heartbeats() {

@@ -10,6 +10,9 @@
 /// heartbeat_runs  – history of heartbeat check outcomes
 /// llm_usage       – log which model/provider was used for each LLM call
 /// approvals       – audit history of human approval decisions
+/// event_triggers  – generic event-based trigger definitions (URL change, keyword, new post)
+/// event_history   – history of event trigger firings
+/// openclaw_runs   – per-invocation OpenClaw CLI stdout/stderr capture
 use rusqlite::{Connection, Result as SqlResult, params};
 use serde::{Deserialize, Serialize};
 use once_cell::sync::Lazy;
@@ -133,6 +136,40 @@ fn init_schema(conn: &Connection) -> SqlResult<()> {
             outcome         TEXT NOT NULL,  -- 'approved' | 'rejected' | 'cancelled'
             decided_at      TEXT NOT NULL,
             notes           TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS event_triggers (
+            id                TEXT PRIMARY KEY,
+            agent_id          TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            trigger_type      TEXT NOT NULL,  -- 'keyword_found' | 'url_change' | 'new_post'
+            target_url        TEXT NOT NULL,
+            keyword           TEXT,           -- used for keyword_found triggers
+            check_interval_min INTEGER NOT NULL DEFAULT 60,
+            enabled           INTEGER NOT NULL DEFAULT 1,
+            last_checked      TEXT,
+            last_hash         TEXT,           -- used for url_change detection
+            created_at        TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS event_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger_id      TEXT NOT NULL,
+            agent_id        TEXT NOT NULL,
+            fired_at        TEXT NOT NULL,
+            matched_content TEXT,
+            status          TEXT NOT NULL DEFAULT 'fired'  -- 'fired' | 'error'
+        );
+
+        CREATE TABLE IF NOT EXISTS openclaw_runs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id    TEXT NOT NULL,
+            config_path TEXT NOT NULL,
+            command     TEXT NOT NULL,
+            stdout      TEXT NOT NULL DEFAULT '',
+            stderr      TEXT NOT NULL DEFAULT '',
+            exit_code   INTEGER,
+            started_at  TEXT NOT NULL,
+            finished_at TEXT
         );
         "#,
     )
@@ -647,6 +684,261 @@ pub fn init() {
     if let Ok(db) = DB.lock() {
         // cron_expression column was added in v0.3 – safe to ignore error if already present
         let _ = db.execute_batch("ALTER TABLE schedules ADD COLUMN cron_expression TEXT;");
-        // approvals table is created in init_schema; nothing to migrate
+        // New tables added in v0.4 – safe to ignore errors if already present
+        let _ = db.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS event_triggers (
+                id                TEXT PRIMARY KEY,
+                agent_id          TEXT NOT NULL,
+                trigger_type      TEXT NOT NULL,
+                target_url        TEXT NOT NULL,
+                keyword           TEXT,
+                check_interval_min INTEGER NOT NULL DEFAULT 60,
+                enabled           INTEGER NOT NULL DEFAULT 1,
+                last_checked      TEXT,
+                last_hash         TEXT,
+                created_at        TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS event_history (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                trigger_id      TEXT NOT NULL,
+                agent_id        TEXT NOT NULL,
+                fired_at        TEXT NOT NULL,
+                matched_content TEXT,
+                status          TEXT NOT NULL DEFAULT 'fired'
+            );
+            CREATE TABLE IF NOT EXISTS openclaw_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id    TEXT NOT NULL,
+                config_path TEXT NOT NULL,
+                command     TEXT NOT NULL,
+                stdout      TEXT NOT NULL DEFAULT '',
+                stderr      TEXT NOT NULL DEFAULT '',
+                exit_code   INTEGER,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT
+            );
+            "#,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event triggers
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EventTriggerRow {
+    pub id: String,
+    pub agent_id: String,
+    pub trigger_type: String,
+    pub target_url: String,
+    pub keyword: Option<String>,
+    pub check_interval_min: i64,
+    pub enabled: bool,
+    pub last_checked: Option<String>,
+    pub last_hash: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EventHistoryRow {
+    pub id: i64,
+    pub trigger_id: String,
+    pub agent_id: String,
+    pub fired_at: String,
+    pub matched_content: Option<String>,
+    pub status: String,
+}
+
+pub fn upsert_event_trigger(t: &EventTriggerRow) -> SqlResult<()> {
+    let db = DB.lock().unwrap();
+    db.execute(
+        "INSERT INTO event_triggers
+             (id, agent_id, trigger_type, target_url, keyword, check_interval_min, enabled, last_checked, last_hash, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(id) DO UPDATE SET
+           trigger_type=excluded.trigger_type,
+           target_url=excluded.target_url,
+           keyword=excluded.keyword,
+           check_interval_min=excluded.check_interval_min,
+           enabled=excluded.enabled",
+        params![
+            t.id, t.agent_id, t.trigger_type, t.target_url, t.keyword,
+            t.check_interval_min, t.enabled as i32,
+            t.last_checked, t.last_hash, t.created_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn list_event_triggers() -> SqlResult<Vec<EventTriggerRow>> {
+    let db = DB.lock().unwrap();
+    let mut stmt = db.prepare(
+        "SELECT id, agent_id, trigger_type, target_url, keyword,
+                check_interval_min, enabled, last_checked, last_hash, created_at
+         FROM event_triggers ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(EventTriggerRow {
+            id: row.get(0)?,
+            agent_id: row.get(1)?,
+            trigger_type: row.get(2)?,
+            target_url: row.get(3)?,
+            keyword: row.get(4)?,
+            check_interval_min: row.get(5)?,
+            enabled: row.get::<_, i32>(6)? != 0,
+            last_checked: row.get(7)?,
+            last_hash: row.get(8)?,
+            created_at: row.get(9)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn delete_event_trigger(id: &str) -> SqlResult<()> {
+    let db = DB.lock().unwrap();
+    db.execute("DELETE FROM event_triggers WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn update_event_trigger_checked(id: &str, last_checked: &str, last_hash: Option<&str>) -> SqlResult<()> {
+    let db = DB.lock().unwrap();
+    db.execute(
+        "UPDATE event_triggers SET last_checked = ?1, last_hash = ?2 WHERE id = ?3",
+        params![last_checked, last_hash, id],
+    )?;
+    Ok(())
+}
+
+pub fn record_event_history(
+    trigger_id: &str,
+    agent_id: &str,
+    fired_at: &str,
+    matched_content: Option<&str>,
+    status: &str,
+) -> SqlResult<i64> {
+    let db = DB.lock().unwrap();
+    db.execute(
+        "INSERT INTO event_history (trigger_id, agent_id, fired_at, matched_content, status)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![trigger_id, agent_id, fired_at, matched_content, status],
+    )?;
+    Ok(db.last_insert_rowid())
+}
+
+pub fn get_event_history(agent_id: Option<&str>, limit: usize) -> SqlResult<Vec<EventHistoryRow>> {
+    let db = DB.lock().unwrap();
+    if let Some(aid) = agent_id {
+        let mut stmt = db.prepare(
+            "SELECT id, trigger_id, agent_id, fired_at, matched_content, status
+             FROM event_history WHERE agent_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![aid, limit as i64], |row| {
+            Ok(EventHistoryRow {
+                id: row.get(0)?,
+                trigger_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                fired_at: row.get(3)?,
+                matched_content: row.get(4)?,
+                status: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    } else {
+        let mut stmt = db.prepare(
+            "SELECT id, trigger_id, agent_id, fired_at, matched_content, status
+             FROM event_history ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(EventHistoryRow {
+                id: row.get(0)?,
+                trigger_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                fired_at: row.get(3)?,
+                matched_content: row.get(4)?,
+                status: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenClaw runs (per-invocation CLI output capture)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OpenClawRunRow {
+    pub id: i64,
+    pub agent_id: String,
+    pub config_path: String,
+    pub command: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i64>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+pub fn record_openclaw_run(
+    agent_id: &str,
+    config_path: &str,
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+    started_at: &str,
+    finished_at: &str,
+) -> SqlResult<i64> {
+    let db = DB.lock().unwrap();
+    db.execute(
+        "INSERT INTO openclaw_runs (agent_id, config_path, command, stdout, stderr, exit_code, started_at, finished_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![agent_id, config_path, command, stdout, stderr, exit_code, started_at, finished_at],
+    )?;
+    Ok(db.last_insert_rowid())
+}
+
+pub fn get_openclaw_runs(agent_id: Option<&str>, limit: usize) -> SqlResult<Vec<OpenClawRunRow>> {
+    let db = DB.lock().unwrap();
+    if let Some(aid) = agent_id {
+        let mut stmt = db.prepare(
+            "SELECT id, agent_id, config_path, command, stdout, stderr, exit_code, started_at, finished_at
+             FROM openclaw_runs WHERE agent_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![aid, limit as i64], |row| {
+            Ok(OpenClawRunRow {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                config_path: row.get(2)?,
+                command: row.get(3)?,
+                stdout: row.get(4)?,
+                stderr: row.get(5)?,
+                exit_code: row.get(6)?,
+                started_at: row.get(7)?,
+                finished_at: row.get(8)?,
+            })
+        })?;
+        rows.collect()
+    } else {
+        let mut stmt = db.prepare(
+            "SELECT id, agent_id, config_path, command, stdout, stderr, exit_code, started_at, finished_at
+             FROM openclaw_runs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(OpenClawRunRow {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                config_path: row.get(2)?,
+                command: row.get(3)?,
+                stdout: row.get(4)?,
+                stderr: row.get(5)?,
+                exit_code: row.get(6)?,
+                started_at: row.get(7)?,
+                finished_at: row.get(8)?,
+            })
+        })?;
+        rows.collect()
     }
 }

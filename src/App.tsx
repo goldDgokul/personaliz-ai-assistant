@@ -81,6 +81,39 @@ interface ApprovalRow {
   notes: string | null;
 }
 
+interface EventTriggerRow {
+  id: string;
+  agent_id: string;
+  trigger_type: string;
+  target_url: string;
+  keyword: string | null;
+  check_interval_min: number;
+  enabled: boolean;
+  last_checked: string | null;
+  created_at: string;
+}
+
+interface EventHistoryRow {
+  id: number;
+  trigger_id: string;
+  agent_id: string;
+  fired_at: string;
+  matched_content: string | null;
+  status: string;
+}
+
+interface OpenClawRunRow {
+  id: number;
+  agent_id: string;
+  config_path: string;
+  command: string;
+  stdout: string;
+  stderr: string;
+  exit_code: number | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
@@ -103,6 +136,20 @@ function App() {
   const [heartbeatRuns, setHeartbeatRuns] = useState<HeartbeatRunRow[]>([]);
   const [llmUsage, setLlmUsage] = useState<LlmUsageRow[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRow[]>([]);
+  const [pendingAgentConfigPreview, setPendingAgentConfigPreview] = useState<{
+    name: string; role: string; goal: string; tools: string[]; schedule: string; sandbox: boolean;
+  } | null>(null);
+  const [eventTriggers, setEventTriggers] = useState<EventTriggerRow[]>([]);
+  const [eventHistory, setEventHistory] = useState<EventHistoryRow[]>([]);
+  const [openClawRuns, setOpenClawRuns] = useState<OpenClawRunRow[]>([]);
+
+  // Event trigger creation form state
+  const [showEventTriggerForm, setShowEventTriggerForm] = useState(false);
+  const [newTriggerAgentId, setNewTriggerAgentId] = useState('');
+  const [newTriggerType, setNewTriggerType] = useState('keyword_found');
+  const [newTriggerUrl, setNewTriggerUrl] = useState('');
+  const [newTriggerKeyword, setNewTriggerKeyword] = useState('');
+  const [newTriggerInterval, setNewTriggerInterval] = useState(60);
 
   // Floating mini-chat overlay (visible on any tab)
   const [isFloatingChatOpen, setIsFloatingChatOpen] = useState(false);
@@ -205,6 +252,21 @@ function App() {
     try {
       const approvs = await invoke<ApprovalRow[]>('db_list_approvals', { limit: 100 });
       setApprovals(approvs);
+    } catch (_) {}
+
+    try {
+      const triggers = await invoke<EventTriggerRow[]>('db_list_event_triggers');
+      setEventTriggers(triggers);
+    } catch (_) {}
+
+    try {
+      const evtHist = await invoke<EventHistoryRow[]>('db_get_event_history', { limit: 50 });
+      setEventHistory(evtHist);
+    } catch (_) {}
+
+    try {
+      const oclRuns = await invoke<OpenClawRunRow[]>('db_get_openclaw_runs', { limit: 50 });
+      setOpenClawRuns(oclRuns);
     } catch (_) {}
   };
 
@@ -428,10 +490,43 @@ Keep responses concise (2-3 sentences max).`;
 
       // Chat-driven onboarding (issue #20)
       if (lower === 'setup' || lower === '/setup' || lower.includes('help me set up')) {
+        // Detect what's available via Tauri commands
+        let nodeStat = '…';
+        let pythonStat = '…';
+        let playwrightStat = '…';
+        let openclawStat = '…';
+        try { nodeStat = (await invoke<boolean>('check_node_available')) ? '✅ Installed' : '❌ Missing'; } catch (_) { nodeStat = '⚠️ Unknown'; }
+        try { pythonStat = (await invoke<boolean>('check_python_available')) ? '✅ Installed' : '❌ Missing'; } catch (_) { pythonStat = '⚠️ Unknown'; }
+        try { playwrightStat = (await invoke<boolean>('check_playwright_available')) ? '✅ Installed' : '❌ Missing'; } catch (_) { playwrightStat = '⚠️ Unknown'; }
+        try { openclawStat = (await invoke<boolean>('check_openclaw_installed')) ? '✅ Installed' : '❌ Missing'; } catch (_) { openclawStat = '⚠️ Unknown'; }
         setMessages(prev => [...prev, {
           role: 'assistant',
-          content: `Sure! Here's a quick setup guide:\n\n1. **Local AI**: Install Ollama from ollama.ai and run \`ollama pull phi3\`. Or start llama-server on port 8080 for llama.cpp.\n2. **OpenClaw**: Run \`npm install -g openclaw\` (Node.js 18+ required).\n3. **API keys** (optional): Add OpenAI or Anthropic key in ⚙️ Settings for cloud models.\n4. **Demo agents**: Say "add demo agents" to create the LinkedIn automation agents instantly.\n\nType "add demo agents" to get started right away!`,
+          content: `🔍 **Dependency Scan**\n\n| Dependency | Status |\n|---|---|\n| Node.js | ${nodeStat} |\n| Python | ${pythonStat} |\n| Playwright | ${playwrightStat} |\n| OpenClaw CLI | ${openclawStat} |\n\n**Next steps:**\n- If Node.js is missing: download from [nodejs.org](https://nodejs.org) and re-open the app\n- OpenClaw missing? Type **"install openclaw"** and I'll run it for you\n- For AI inference locally, run \`ollama pull phi3\` or set an API key in ⚙️ Settings\n- Type **"add demo agents"** to add the pre-built LinkedIn agents\n\nType **"install openclaw"** to install it now!`,
         }]);
+        setIsLoading(false);
+        return;
+      }
+
+      // Install OpenClaw via chat
+      if (lower === 'install openclaw' || lower.includes('install openclaw')) {
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: '⏳ Running `npm install -g openclaw`… This may take a minute.',
+        }]);
+        try {
+          const result = await invoke<string>('run_openclaw_command', { command: 'install' });
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            content: `✅ OpenClaw installed!\n\n\`\`\`\n${result}\n\`\`\`\n\nYou're ready to go! Type **"add demo agents"** to get started.`,
+          }]);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            content: `❌ Install failed: ${msg}\n\nTry manually: \`npm install -g openclaw\``,
+          }]);
+        }
+        setIsLoading(false);
         return;
       }
 
@@ -439,14 +534,60 @@ Keep responses concise (2-3 sentences max).`;
       if (lower.includes('create agent') || lower.includes('new agent') ||
           lower.includes('linkedin') || lower.includes('trending') ||
           lower.includes('make an agent') || lower.includes('build an agent')) {
-        // Show a config preview snippet in chat before opening modal
-        const nameHint = lower.includes('linkedin') ? 'LinkedIn Automation' :
+        // Infer agent name/role/goal/schedule from user message
+        const nameHint = lower.includes('hashtag') ? '#openclaw Hashtag Commenter' :
+                         lower.includes('linkedin') ? 'LinkedIn Content Agent' :
                          lower.includes('trending') ? 'Trending Poster' : 'Custom Agent';
+        const roleHint = lower.includes('comment') ? 'LinkedIn Engagement Specialist' :
+                         lower.includes('post') || lower.includes('trending') ? 'LinkedIn Content Creator' :
+                         'Automation Agent';
+        const goalHint = lower.includes('comment') || lower.includes('hashtag')
+          ? 'Search LinkedIn for #openclaw posts and leave a promotional comment.'
+          : lower.includes('post') || lower.includes('trending')
+          ? 'Find trending OpenClaw topics, generate a LinkedIn post, get approval, then publish.'
+          : 'Automate a task based on user instructions.';
+        const scheduleHint = lower.includes('hour') ? 'Hourly' :
+                             lower.includes('week') ? 'Weekly' : 'Daily';
+        const toolsHint = (lower.includes('linkedin') || lower.includes('post') || lower.includes('comment'))
+          ? ['LinkedIn', 'Browser'] : [];
+
+        const previewConfig = {
+          name: nameHint,
+          role: roleHint,
+          goal: goalHint,
+          tools: toolsHint,
+          schedule: scheduleHint,
+          sandbox: true,
+        };
+
         setMessages(prev => [...prev, {
           role: 'assistant',
-          content: `🔧 I'll help you create a new agent! Here's a preview of what we'll configure:\n\n\`\`\`json\n{\n  "name": "${nameHint}",\n  "role": "...",\n  "goal": "...",\n  "tools": [],\n  "schedule": "Daily"\n}\n\`\`\`\n\nOpening the agent creation wizard…`,
+          content: `🔧 Here's the agent config I'll create based on your request:\n\n\`\`\`json\n${JSON.stringify(previewConfig, null, 2)}\n\`\`\`\n\nType **"confirm"** to deploy this agent, or **"edit agent"** to customise it in the creation wizard.`,
         }]);
-        setTimeout(() => setShowAgentModal(true), 800);
+
+        // Store pending config for confirmation
+        setPendingAgentConfigPreview(previewConfig);
+        setIsLoading(false);
+        return;
+      }
+
+      // Confirm deployment of NL-generated agent config
+      if (lower === 'confirm' || lower === 'yes' || lower === 'deploy') {
+        if (pendingAgentConfigPreview) {
+          const pending = pendingAgentConfigPreview;
+          setPendingAgentConfigPreview(null);
+          createAgent(pending);
+          setIsLoading(false);
+          return;
+        }
+      }
+
+      // Edit pending agent config in modal
+      if (lower === 'edit agent' || lower === 'edit') {
+        setPendingAgentConfigPreview(null);
+        setTimeout(() => setShowAgentModal(true), 300);
+        setIsLoading(false);
+        return;
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -584,6 +725,63 @@ Keep responses concise (2-3 sentences max).`;
   };
 
   // -------------------------------------------------------------------------
+  // Event triggers CRUD
+  // -------------------------------------------------------------------------
+
+  const createEventTrigger = async () => {
+    if (!newTriggerAgentId || !newTriggerUrl) return;
+    if (!newTriggerUrl.startsWith('http://')) {
+      addLog('system', 'error', 'Event trigger URL must start with http:// (TLS not supported in built-in poller)');
+      return;
+    }
+    try {
+      const id = await invoke<string>('db_upsert_event_trigger', {
+        agentId: newTriggerAgentId,
+        triggerType: newTriggerType,
+        targetUrl: newTriggerUrl,
+        keyword: newTriggerKeyword || null,
+        checkIntervalMin: newTriggerInterval,
+        enabled: true,
+      });
+      const newTrigger: EventTriggerRow = {
+        id,
+        agent_id: newTriggerAgentId,
+        trigger_type: newTriggerType,
+        target_url: newTriggerUrl,
+        keyword: newTriggerKeyword || null,
+        check_interval_min: newTriggerInterval,
+        enabled: true,
+        last_checked: null,
+        created_at: new Date().toISOString(),
+      };
+      setEventTriggers(prev => [newTrigger, ...prev]);
+      const agent = agents.find(a => a.id === newTriggerAgentId);
+      addLog(newTriggerAgentId, 'success', `Event trigger created for "${agent?.name}" (${newTriggerType})`);
+      setShowEventTriggerForm(false);
+      setNewTriggerUrl('');
+      setNewTriggerKeyword('');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog('system', 'error', `Failed to create event trigger: ${msg}`);
+    }
+  };
+
+  const deleteEventTrigger = async (triggerId: string) => {
+    try {
+      await invoke('db_delete_event_trigger', { id: triggerId });
+      setEventTriggers(prev => prev.filter(t => t.id !== triggerId));
+      addLog('system', 'info', 'Event trigger deleted');
+    } catch (_) {}
+  };
+
+  const refreshOpenClawRuns = async () => {
+    try {
+      const runs = await invoke<OpenClawRunRow[]>('db_get_openclaw_runs', { limit: 50 });
+      setOpenClawRuns(runs);
+    } catch (_) {}
+  };
+
+  // -------------------------------------------------------------------------
   // Run agent
   // -------------------------------------------------------------------------
 
@@ -595,19 +793,45 @@ Keep responses concise (2-3 sentences max).`;
     addLog(agentId, 'info', `🚀 Running ${agent.name} ${modeText}…`);
     setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'running' } : a));
 
+    // Record run start
+    const runStarted = new Date().toISOString();
+    try { await invoke('db_start_run', { agentId, startedAt: runStarted }); } catch (_) {}
+
     try {
       if (agent.agentType === 'hashtag') {
         await runHashtagAgent(agent);
         return;
       }
 
-      // Trending / custom agent – generate content then optionally show approval
+      // Trending / custom agent – try OpenClaw first, then fall back to Python
       addLog(agentId, 'info', '🔍 Searching trending topics…');
       await delay(800);
       addLog(agentId, 'info', '✍️ Generating LinkedIn post…');
       await delay(800);
 
       const generatedContent = buildTrendingPost();
+
+      // Try to run via OpenClaw config if a config file was previously generated
+      let openClawResult: any = null;
+      try {
+        const configPath = await invoke<string>('create_openclaw_config', {
+          agentId,
+          agentName: agent.name,
+          role: agent.role,
+          goal: agent.goal,
+          tools: agent.tools,
+          schedule: agent.schedule,
+          outputDir: null,
+        });
+        addLog(agentId, 'info', `📄 OpenClaw config: ${configPath}`);
+        openClawResult = await invoke<any>('run_openclaw_agent', { agentId, configPath });
+        addLog(agentId, openClawResult.status === 'success' ? 'success' : 'warning',
+          `[OpenClaw] exit=${openClawResult.exit_code ?? '?'} ${(openClawResult.stdout || openClawResult.stderr || '').slice(0, 200)}`);
+        // Refresh openclaw runs panel
+        await refreshOpenClawRuns();
+      } catch (_) {
+        // OpenClaw not installed or failed – continue with Python fallback
+      }
 
       if (!sandboxMode) {
         addLog(agentId, 'info', '👀 Awaiting user approval…');
@@ -626,7 +850,7 @@ Keep responses concise (2-3 sentences max).`;
 
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `✅ **${agent.name}** finished in sandbox mode!\n\nGenerated:\n"${generatedContent.slice(0, 150)}…"\n\nDisable Sandbox mode in Settings to post for real.`,
+        content: `✅ **${agent.name}** finished in sandbox mode!\n\nGenerated:\n"${generatedContent.slice(0, 150)}…"\n\n${openClawResult ? '🔧 OpenClaw config was executed.\n\n' : ''}Disable Sandbox mode in Settings to post for real.`,
       }]);
 
     } catch (err) {
@@ -833,6 +1057,7 @@ Perfect for non-technical users who want to automate their workflows!
           {[
             { id: 'chat', label: '💬 Chat' },
             { id: 'agents', label: `🤖 Agents (${agents.length})` },
+            { id: 'events', label: `⚡ Events (${eventTriggers.length})` },
             { id: 'logs', label: '📊 Logs' },
             { id: 'settings', label: '⚙️ Settings' },
           ].map(tab => (
@@ -913,7 +1138,7 @@ Perfect for non-technical users who want to automate their workflows!
                 className="chat-input"
                 disabled={isLoading}
               />
-              <button onClick={handleSendMessage} className="send-btn" disabled={isLoading || !inputValue.trim()}>
+              <button onClick={() => handleSendMessage()} className="send-btn" disabled={isLoading || !inputValue.trim()}>
                 {isLoading ? '…' : 'Send'}
               </button>
             </div>
@@ -1043,6 +1268,172 @@ Perfect for non-technical users who want to automate their workflows!
           </div>
         )}
 
+        {/* EVENTS TAB */}
+        {activeTab === 'events' && (
+          <div className="agents-container">
+            <div className="agents-header">
+              <h2>⚡ Event Triggers</h2>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  className="create-agent-btn"
+                  onClick={() => {
+                    if (agents.length > 0) setNewTriggerAgentId(agents[0].id);
+                    setShowEventTriggerForm(true);
+                  }}
+                  disabled={agents.length === 0}
+                >
+                  + New Trigger
+                </button>
+              </div>
+            </div>
+
+            <p className="setting-description" style={{ marginBottom: '16px' }}>
+              Event triggers run an agent automatically when a condition fires – e.g. when a keyword appears
+              on a web page, or when a URL's content changes. They are polled every 60 seconds by the background scheduler.
+            </p>
+
+            {agents.length === 0 && (
+              <div className="empty-state">
+                <p>Create at least one agent before adding event triggers.</p>
+              </div>
+            )}
+
+            {/* New Trigger Form */}
+            {showEventTriggerForm && (
+              <div className="agent-card" style={{ marginBottom: '24px', border: '1px dashed var(--accent)' }}>
+                <h3 style={{ marginBottom: '12px' }}>🔧 New Event Trigger</h3>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                  <div>
+                    <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Agent to trigger</label>
+                    <select
+                      value={newTriggerAgentId}
+                      onChange={e => setNewTriggerAgentId(e.target.value)}
+                      style={{ width: '100%', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '4px' }}
+                    >
+                      {agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Trigger type</label>
+                    <select
+                      value={newTriggerType}
+                      onChange={e => setNewTriggerType(e.target.value)}
+                      style={{ width: '100%', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '4px' }}
+                    >
+                      <option value="keyword_found">🔍 Keyword found on page</option>
+                      <option value="url_change">🔄 URL content changed</option>
+                      <option value="new_post">📰 New post / feed item detected</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Target URL (http:// only — TLS not supported in built-in poller)</label>
+                    <input
+                      type="url"
+                      value={newTriggerUrl}
+                      onChange={e => setNewTriggerUrl(e.target.value)}
+                      placeholder="http://example.com/feed"
+                      style={{ width: '100%', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: newTriggerUrl && !newTriggerUrl.startsWith('http://') ? '1px solid var(--error)' : '1px solid var(--border)', borderRadius: '4px', boxSizing: 'border-box' }}
+                    />
+                    {newTriggerUrl && !newTriggerUrl.startsWith('http://') && (
+                      <p style={{ fontSize: '11px', color: 'var(--error)', margin: '4px 0 0' }}>
+                        ⚠️ Only http:// URLs are supported. https:// requires TLS support not available in the built-in poller.
+                      </p>
+                    )}
+                  </div>
+                  {newTriggerType === 'keyword_found' && (
+                    <div>
+                      <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Keyword</label>
+                      <input
+                        type="text"
+                        value={newTriggerKeyword}
+                        onChange={e => setNewTriggerKeyword(e.target.value)}
+                        placeholder="e.g. openclaw"
+                        style={{ width: '100%', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '4px', boxSizing: 'border-box' }}
+                      />
+                    </div>
+                  )}
+                  <div>
+                    <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Check interval (minutes)</label>
+                    <input
+                      type="number"
+                      min={5}
+                      max={1440}
+                      value={newTriggerInterval}
+                      onChange={e => setNewTriggerInterval(Number(e.target.value))}
+                      style={{ width: '120px', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '4px' }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button className="run-btn" onClick={createEventTrigger}>✅ Create Trigger</button>
+                    <button className="delete-btn" onClick={() => setShowEventTriggerForm(false)}>Cancel</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Existing triggers list */}
+            {eventTriggers.length === 0 && !showEventTriggerForm ? (
+              <div className="empty-state">
+                <p>No event triggers yet.</p>
+                <p style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                  Click <strong>+ New Trigger</strong> to add one. Triggers are polled by the background scheduler.
+                </p>
+              </div>
+            ) : (
+              <div className="agents-grid">
+                {eventTriggers.map(t => {
+                  const agent = agents.find(a => a.id === t.agent_id);
+                  return (
+                    <div key={t.id} className="agent-card">
+                      <div className="agent-header">
+                        <h3 style={{ fontSize: '14px' }}>
+                          {t.trigger_type === 'keyword_found' ? '🔍' : t.trigger_type === 'url_change' ? '🔄' : '📰'}{' '}
+                          {t.trigger_type.replace(/_/g, ' ')}
+                        </h3>
+                        <span className={`status-badge ${t.enabled ? 'completed' : 'idle'}`}>
+                          {t.enabled ? 'enabled' : 'disabled'}
+                        </span>
+                      </div>
+                      <div className="agent-details">
+                        <p><strong>Agent:</strong> {agent?.name ?? t.agent_id.slice(-8)}</p>
+                        <p><strong>URL:</strong> <span style={{ wordBreak: 'break-all', fontSize: '12px' }}>{t.target_url}</span></p>
+                        {t.keyword && <p><strong>Keyword:</strong> {t.keyword}</p>}
+                        <p><strong>Interval:</strong> every {t.check_interval_min} min</p>
+                        {t.last_checked && <p><strong>Last checked:</strong> {fmtTs(t.last_checked)}</p>}
+                      </div>
+                      <div className="agent-actions">
+                        <button className="delete-btn" onClick={() => deleteEventTrigger(t.id)}>🗑️ Delete</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Event history */}
+            <div style={{ marginTop: '32px' }}>
+              <h3 style={{ marginBottom: '12px' }}>📋 Event History</h3>
+              {eventHistory.length === 0 ? (
+                <p style={{ color: 'var(--text-secondary)', fontSize: '13px' }}>
+                  No events fired yet. Triggers are polled every 60 seconds when the scheduler runs.
+                </p>
+              ) : (
+                <div className="logs-list">
+                  {eventHistory.slice(0, 30).map(e => (
+                    <div key={e.id} className={`log-entry ${e.status === 'fired' ? 'success' : 'error'}`}>
+                      <span className="log-time">{fmtTs(e.fired_at)}</span>
+                      <span className={`log-level ${e.status === 'fired' ? 'success' : 'error'}`}>[{e.status.toUpperCase()}]</span>
+                      <span className="log-message">
+                        Agent {e.agent_id.slice(-8)} – {e.matched_content?.slice(0, 120) || 'No details'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* LOGS TAB */}
         {activeTab === 'logs' && (
           <div className="logs-container">
@@ -1103,6 +1494,35 @@ Perfect for non-technical users who want to automate their workflows!
                 </div>
               </div>
             )}
+
+            {/* OpenClaw Runs Log */}
+            <div style={{ marginTop: '32px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
+                <h3>🔧 OpenClaw Runs</h3>
+                <button className="check-btn" onClick={refreshOpenClawRuns}>🔄 Refresh</button>
+              </div>
+              {openClawRuns.length === 0 ? (
+                <p style={{ color: 'var(--text-secondary)', fontSize: '13px' }}>
+                  No OpenClaw runs yet. Run an agent to see OpenClaw CLI output here.
+                </p>
+              ) : (
+                <div className="logs-list">
+                  {openClawRuns.slice(0, 20).map(r => (
+                    <div key={r.id} className={`log-entry ${r.exit_code === 0 ? 'success' : r.exit_code === null ? 'info' : 'error'}`}>
+                      <span className="log-time">{fmtTs(r.started_at)}</span>
+                      <span className={`log-level ${r.exit_code === 0 ? 'success' : r.exit_code === null ? 'info' : 'error'}`}>
+                        [exit:{r.exit_code ?? '?'}]
+                      </span>
+                      <span className="log-message" style={{ fontFamily: 'monospace', fontSize: '11px' }}>
+                        Agent {r.agent_id.slice(-8)} | {r.command.slice(0, 60)}
+                        {r.stdout && ` › ${r.stdout.slice(0, 100)}`}
+                        {r.stderr && !r.stdout && ` ⚠ ${r.stderr.slice(0, 100)}`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -1276,8 +1696,8 @@ Perfect for non-technical users who want to automate their workflows!
       />
 
       {/* Floating mini-chat overlay (issue #16) – visible on all tabs except chat */}
-      {isFloatingChatOpen && activeTab !== 'chat' && (
-        <div className="floating-chat-overlay">
+      {isFloatingChatOpen && (
+        <div className="floating-chat-overlay" style={{ zIndex: 10000 }}>
           <div className="floating-chat-header">
             <span>🤖 Quick Chat</span>
             <button onClick={() => setIsFloatingChatOpen(false)} className="floating-close-btn">✕</button>
@@ -1326,17 +1746,17 @@ Perfect for non-technical users who want to automate their workflows!
       {/* Floating Assistant Icon – always visible */}
       <button
         className={`floating-assistant-btn ${isChatOpen ? 'open' : ''}`}
-        title={activeTab !== 'chat' && isFloatingChatOpen ? 'Close mini chat' : activeTab !== 'chat' ? 'Open mini chat' : isChatOpen ? 'Minimize chat' : 'Open chat'}
+        title={isFloatingChatOpen ? 'Close mini chat' : 'Open mini chat'}
         onClick={() => {
-          if (activeTab !== 'chat') {
-            setIsFloatingChatOpen(prev => !prev);
-          } else {
+          setIsFloatingChatOpen(prev => !prev);
+          if (!isFloatingChatOpen) {
             setIsChatOpen(prev => !prev);
           }
         }}
         aria-label="Toggle chat panel"
+        style={{ zIndex: 10001 }}
       >
-        {activeTab !== 'chat' && isFloatingChatOpen ? '✕' : '🤖'}
+        {isFloatingChatOpen ? '✕' : '🤖'}
       </button>
     </div>
   );

@@ -314,6 +314,9 @@ Database path:
 | `heartbeat_runs` | Historical heartbeat check results |
 | `llm_usage` | Which provider/model was used for each LLM call |
 | `approvals` | Human approval decisions (outcome, content preview) |
+| `event_triggers` | Generic event trigger definitions (type, URL, keyword, interval) |
+| `event_history` | One row per event trigger firing |
+| `openclaw_runs` | Per-invocation OpenClaw CLI stdout/stderr capture |
 
 ---
 
@@ -361,18 +364,18 @@ Log into LinkedIn **once** — the session is reused on subsequent runs.
 ```
 personaliz-ai-assistant/
 ├── src/                              React + TypeScript frontend
-│   ├── App.tsx                       Main app (Chat, Agents, Logs, Settings + floating mini-chat)
+│   ├── App.tsx                       Main app (Chat, Agents, Events, Logs, Settings + floating mini-chat)
 │   └── components/
 │       ├── Onboarding.tsx            5-step wizard (Ollama or llama.cpp, OpenClaw, API keys)
 │       ├── AgentCreationModal.tsx    4-step wizard incl. cron expression input + live validation
 │       └── ApprovalModal.tsx         Human-in-the-loop review (logs outcome to DB)
 ├── src-tauri/
 │   └── src/
-│       ├── main.rs                   All Tauri commands
-│       ├── db.rs                     SQLite layer (rusqlite) – 8 tables
-│       └── scheduler.rs              Background scheduler + cron parser + heartbeat checks
+│       ├── main.rs                   All Tauri commands (incl. run_openclaw_agent, event triggers)
+│       ├── db.rs                     SQLite layer (rusqlite) – 11 tables
+│       └── scheduler.rs              Background scheduler + cron parser + heartbeat + event trigger checks
 └── public/
-    └── agent_engine.py               Python Playwright automation engine
+    └── agent_engine.py               Python Playwright automation engine (with RSS topic fetching)
 ```
 
 ### Tauri command reference
@@ -386,11 +389,55 @@ personaliz-ai-assistant/
 | `post_to_linkedin` / `comment_linkedin_hashtag` | LinkedIn automation via agent_engine.py |
 | `check_openclaw_installed` / `install_openclaw` / `run_openclaw_command` | OpenClaw dependency management |
 | `create_openclaw_config` | Writes `openclaw.config.json` for an agent |
+| `run_openclaw_agent` | Runs `openclaw run <config_path>` and stores stdout/stderr in `openclaw_runs` table |
+| `db_get_openclaw_runs` | Returns stored OpenClaw run records |
 | `validate_cron_expression` | Validates a 5-field cron expression and returns next run time |
 | `db_upsert_schedule` | Upsert schedule (supports `cron_expression` field) |
 | `db_record_approval` / `db_list_approvals` | Approval audit log CRUD |
 | `db_upsert_heartbeat` / `db_list_heartbeats` / `db_delete_heartbeat` | Heartbeat config CRUD |
 | `db_get_heartbeat_runs` | Heartbeat history |
+| `db_upsert_event_trigger` / `db_list_event_triggers` / `db_delete_event_trigger` | Event trigger CRUD |
+| `db_get_event_history` | Event trigger firing history |
+| `check_node_available` / `check_python_available` / `check_playwright_available` | Dependency detection |
+| `get_os_info` | Returns OS platform and arch |
+
+---
+
+## ⚡ Event Triggers (Generic Event Handler)
+
+Event triggers run an agent automatically when a web condition fires. They are polled every 60 seconds by the Rust scheduler alongside regular cron schedules.
+
+### Trigger types
+
+| Type | What it does |
+|------|-------------|
+| `keyword_found` | Fetches a URL, fires the agent if the keyword appears in the page body |
+| `url_change` | Fires if the page content has changed since last check (FNV hash comparison) |
+| `new_post` | Fires when new RSS/feed items appear at the target URL |
+
+### How it works internally
+
+```
+Scheduler loop (every 60s)
+  └── run_due_event_triggers()
+        ├── For each enabled trigger
+        │     ├── Check if check_interval_min has elapsed since last_checked
+        │     ├── HTTP GET target_url (blocking, stdlib only, http:// only)
+        │     ├── Compare against last_hash / search for keyword
+        │     ├── If triggered → record_event_history + run agent Python
+        │     └── Update last_checked and last_hash in SQLite
+```
+
+### SQLite tables
+
+| Table | Contents |
+|-------|----------|
+| `event_triggers` | Trigger definitions (type, URL, keyword, interval, enabled) |
+| `event_history` | One row per firing (trigger_id, agent_id, fired_at, matched_content) |
+
+### UI
+
+Create and manage triggers in the **⚡ Events** tab. View firing history below the trigger list.
 
 ---
 
@@ -431,3 +478,31 @@ npm run tauri build
 ## 📜 License
 
 MIT © 2024 Personaliz
+
+---
+
+## 🎬 Demo
+
+> **Demo video / animated GIF:** *(link to be added — run `npm run tauri dev`, open the app, type `add demo agents` in chat, then run the LinkedIn Trending Poster in sandbox mode to see the full flow)*
+
+---
+
+## 📋 Submission Checklist
+
+| Item | Detail |
+|------|--------|
+| **Repository** | https://github.com/goldDgokul/personaliz-ai-assistant |
+| **Branch** | `main` (all features merged) |
+| **Demo agents** | LinkedIn Trending Poster + #openclaw Hashtag Commenter — run out-of-the-box in sandbox mode |
+| **OpenClaw CLI integration** | `create_openclaw_config` writes `openclaw.config.json`; `run_openclaw_agent` invokes `openclaw run <path>` and captures stdout/stderr in `openclaw_runs` table |
+| **Chat-driven setup** | Type `setup` in chat → live dependency scan; type `install openclaw` → runs install |
+| **Cron scheduling** | Full 5-field cron expressions stored in SQLite; validated live in UI; next run preview |
+| **Event triggers** | Generic event handler (keyword found / URL change / new post) — managed in ⚡ Events tab |
+| **NL→config→deploy** | Type `create agent` / describe a task → JSON config preview in chat → type `confirm` to deploy |
+| **Approval audit** | Every approval/rejection recorded in `approvals` table; visible in Logs tab |
+| **OpenClaw runs log** | Every `openclaw run` stdout/stderr stored in `openclaw_runs` table; visible in Logs tab |
+| **Sandbox mode** | Enabled by default; toggle in Settings |
+| **Local LLM** | Ollama (phi3 / llama3) _or_ llama.cpp (`llama-server`) — configured in onboarding |
+| **External LLM** | OpenAI / Anthropic / Google AI — set API key in Settings |
+| **Floating assistant** | 🤖 FAB always visible; opens mini-chat overlay on all tabs; `z-index: 10001` |
+| **Documentation** | This README — covers all integration points, CLI commands, model routing, tables |

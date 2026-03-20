@@ -66,13 +66,67 @@ class AgentEngine:
 
     def search_trending_topics(self) -> List[str]:
         self.log("info", "🔍 Searching for trending OpenClaw topics...")
-        topics = [
+
+        # Try to fetch from real RSS feeds / curated sources
+        topics = self._fetch_topics_from_rss()
+        if topics:
+            self.log("success", f"✅ Fetched {len(topics)} live topics from feed")
+            return topics
+
+        # Fallback to curated hardcoded topics
+        fallback_topics = [
             "How OpenClaw is revolutionizing RPA automation",
             "5 ways non-technical users can automate with OpenClaw",
             "OpenClaw + Desktop: The future of no-code automation",
+            "Why OpenClaw is the easiest way to get started with browser automation",
+            "Automating LinkedIn workflows with OpenClaw – a practical guide",
         ]
-        self.log("success", f"✅ Found {len(topics)} trending topics")
-        return topics
+        self.log("info", f"ℹ️  Using {len(fallback_topics)} curated topics (no live feed available)")
+        return fallback_topics
+
+    def _fetch_topics_from_rss(self) -> List[str]:
+        """Attempt to fetch trending automation/AI topics from public RSS feeds.
+
+        Returns an empty list on failure so the caller can fall back gracefully.
+        Only uses the stdlib (no requests dependency required).
+        """
+        import urllib.request
+        import xml.etree.ElementTree as ET
+
+        # Public RSS feeds related to automation/AI/no-code
+        feeds = [
+            "https://zapier.com/engineering/feeds/rss/",
+            "https://medium.com/feed/tag/automation",
+        ]
+        topics: List[str] = []
+        for feed_url in feeds:
+            try:
+                req = urllib.request.Request(
+                    feed_url,
+                    headers={"User-Agent": "personaliz-assistant/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = resp.read().decode("utf-8", errors="replace")
+                root = ET.fromstring(data)
+                ns = {"atom": "http://www.w3.org/2005/Atom"}
+                # RSS <item><title> or Atom <entry><title>
+                for item in root.iter("item"):
+                    title = item.findtext("title", "").strip()
+                    if title and len(title) > 10:
+                        topics.append(title)
+                    if len(topics) >= 5:
+                        break
+                for entry in root.iter("{http://www.w3.org/2005/Atom}entry"):
+                    title_el = entry.find("{http://www.w3.org/2005/Atom}title")
+                    if title_el is not None and title_el.text:
+                        topics.append(title_el.text.strip())
+                    if len(topics) >= 5:
+                        break
+                if topics:
+                    break
+            except Exception:
+                continue
+        return topics[:5]
 
     def generate_linkedin_posts(self, topics: List[str]) -> List[str]:
         self.log("info", "✍️ Generating LinkedIn posts...")
@@ -322,7 +376,7 @@ class AgentEngine:
     # High-level agent runners
     # ------------------------------------------------------------------
 
-    def run_linkedin_trending_agent(self) -> Dict[str, Any]:
+    def run_linkedin_trending_agent(self, approved: bool = False) -> Dict[str, Any]:
         self.log("info", "🚀 Starting LinkedIn Trending Agent...")
         try:
             topics = self.search_trending_topics()
@@ -333,7 +387,15 @@ class AgentEngine:
                     self.log("info", f"[SANDBOX] Preview post:\n{posts[0][:200]}")
                     success = self.post_to_linkedin_browser(posts[0])
                 else:
-                    # Production: caller must have obtained approval before invoking
+                    # Production: require explicit approval flag to prevent accidental posts
+                    if not approved:
+                        self.log("warning", "⚠️  Production mode requires human approval before posting.")
+                        return {
+                            "status": "pending_approval",
+                            "message": "Approval required before posting in production mode.",
+                            "logs": self.logs,
+                            "content": posts[0],
+                        }
                     success = self.post_to_linkedin_browser(posts[0])
 
                 if success:
@@ -391,6 +453,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_post = sub.add_parser("linkedin_post", help="Post to LinkedIn feed")
     p_post.add_argument("--content", required=True, help="Post content")
     p_post.add_argument("--sandbox", default="true", help="true|false")
+    p_post.add_argument("--approved", default="false", help="true|false – approval confirmed")
     p_post.add_argument("--profile-dir", default=None)
 
     # --- linkedin_comment_hashtag ---

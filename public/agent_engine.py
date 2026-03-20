@@ -152,12 +152,53 @@ class AgentEngine:
 
                 # Open post composer
                 self.log("info", "✍️ Opening post composer...")
-                composer_btn = page.locator(
-                    "button:has-text('Start a post'), "
-                    "[aria-label='Create a post'], "
-                    ".share-box-feed-entry__trigger"
-                ).first
-                composer_btn.click(timeout=10000)
+                # Try multiple known selectors for the "Start a post" button
+                # (LinkedIn periodically changes class names and ARIA labels)
+                composer_selectors = [
+                    "button:has-text('Start a post')",
+                    "[aria-label='Start a post']",
+                    "[aria-label='Create a post']",
+                    ".share-box-feed-entry__trigger",
+                    ".share-creation-state__trigger",
+                    "button.share-box__open",
+                    "[data-control-name='share.open_create_modal_trigger']",
+                    "div.share-box-feed-entry__top-bar button",
+                ]
+                clicked = False
+                for selector in composer_selectors:
+                    try:
+                        btn = page.locator(selector).first
+                        if btn.count() > 0:
+                            btn.scroll_into_view_if_needed()
+                            btn.click(timeout=5000)
+                            clicked = True
+                            self.log("info", f"✅ Opened composer via selector: {selector}")
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    # Last resort: wait a bit more and retry the primary selectors
+                    self.log("info", "⏳ Composer button not found yet, waiting 5 s and retrying…")
+                    page.wait_for_timeout(5000)
+                    for selector in composer_selectors[:4]:
+                        try:
+                            btn = page.locator(selector).first
+                            if btn.count() > 0:
+                                btn.scroll_into_view_if_needed()
+                                btn.click(timeout=8000)
+                                clicked = True
+                                self.log("info", f"✅ Opened composer via selector: {selector}")
+                                break
+                        except Exception:
+                            continue
+
+                if not clicked:
+                    raise TimeoutError(
+                        "Could not find the 'Start a post' button on LinkedIn.\n"
+                        "The LinkedIn UI may have changed, or the page is not fully loaded.\n"
+                        "Tip: Open the browser profile manually, log in, and verify you see the feed."
+                    )
                 page.wait_for_timeout(1500)
 
                 # Type content into editor

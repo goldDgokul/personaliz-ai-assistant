@@ -24,6 +24,7 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
   // Step 4 – API keys
   const [openaiKey, setOpenaiKey] = useState('');
   const [anthropicKey, setAnthropicKey] = useState('');
+  const [googleKey, setGoogleKey] = useState('');
 
   // -----------------------------------------------------------------------
   // Step 2 helpers – local LLM
@@ -110,6 +111,13 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
       if (!openaiKey.trim()) {
         localStorage.setItem('llm_api_key', anthropicKey.trim());
         localStorage.setItem('llm_model', 'claude-3-5-sonnet-20241022');
+      }
+    }
+    if (googleKey.trim()) {
+      localStorage.setItem('google_api_key', googleKey.trim());
+      if (!openaiKey.trim() && !anthropicKey.trim()) {
+        localStorage.setItem('llm_api_key', googleKey.trim());
+        localStorage.setItem('llm_model', 'gemini-2.0-flash');
       }
     }
     if (localModel) localStorage.setItem('local_model', localModel);
@@ -293,7 +301,7 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
             <h1>Optional: Add External API Key</h1>
             <p>
               Personaliz works <strong>offline</strong> with a local model. Add an API key only if
-              you want cloud models (GPT-4, Claude).
+              you want cloud models (GPT-4, Claude, Gemini).
             </p>
             <p style={{ color: '#888', fontSize: '13px', marginBottom: '16px' }}>
               💡 If no key is set, the app uses your local Ollama or llama.cpp model automatically.
@@ -309,6 +317,15 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
                 <h3>Anthropic (Claude)</h3>
                 <p>Get from: <a href="https://console.anthropic.com" target="_blank" rel="noopener noreferrer">console.anthropic.com</a></p>
                 <input type="password" placeholder="sk-ant-…" value={anthropicKey} onChange={e => setAnthropicKey(e.target.value)} />
+              </div>
+              <div className="api-option">
+                <h3>Google AI (Gemini / Gemma)</h3>
+                <p>Get from: <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer">aistudio.google.com</a></p>
+                <input type="password" placeholder="AIzaSy…" value={googleKey} onChange={e => setGoogleKey(e.target.value)} />
+                <p style={{ color: '#888', fontSize: '12px', marginTop: '4px' }}>
+                  Supports Gemini 2.0 Flash, Gemini 1.5 Pro, Gemma 2 2B, and more.<br />
+                  For free local Gemma: <code>ollama pull gemma2:2b</code> (no key needed).
+                </p>
               </div>
             </div>
 

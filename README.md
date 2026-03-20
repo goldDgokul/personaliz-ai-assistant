@@ -114,13 +114,30 @@ The app picks the LLM **automatically** based on Settings, with no manual switch
 
 ```
 if llm_api_key is set in Settings
-  → use external provider (OpenAI / Anthropic)
+  → use external provider (OpenAI / Anthropic / Google)
   → routed through Tauri backend (logged to llm_usage table in SQLite)
 else if Ollama is running on :11434
   → use local Ollama model
 else
   → use llama.cpp model on :8080
 ```
+
+### Supported external providers & key formats
+
+| Provider | Key format | Example models |
+|---|---|---|
+| **OpenAI** | `sk-…` | `gpt-4`, `gpt-4o`, `gpt-3.5-turbo` |
+| **Anthropic** | `sk-ant-…` | `claude-3-5-sonnet-20241022`, `claude-3-opus-20240229` |
+| **Google AI** | `AIzaSy…` | `gemini-2.0-flash`, `gemini-1.5-pro`, `gemma-2-2b-it` |
+
+> **Using Gemma 2B for free?** Run it locally via Ollama — no API key needed:
+> ```
+> ollama pull gemma2:2b
+> ```
+> Then select `gemma2:2b` in ⚙️ Settings → Local AI Model.
+
+> **Using Google AI Studio key?** Enter your `AIzaSy…` key in ⚙️ Settings → External LLM  
+> and select a **Gemini** or **Gemma** model from the *External Model* dropdown.
 
 Every chat message records which provider and model was used in the `llm_usage` SQLite table.  
 Visible in **Logs tab → LLM Usage Log**.

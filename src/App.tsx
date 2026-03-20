@@ -318,6 +318,7 @@ Keep responses concise (2-3 sentences max).`;
     }
 
     const systemPrompt = `You are Personaliz, a helpful desktop assistant for OpenClaw automation. Keep responses concise.`;
+    const isGoogle = model.startsWith('gemini') || model.startsWith('gemma');
     if (model.includes('claude')) {
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -336,9 +337,40 @@ Keep responses concise (2-3 sentences max).`;
           ],
         }),
       });
-      if (!response.ok) throw new Error(`Claude API error: ${response.status}`);
+      if (!response.ok) throw new Error(`Anthropic API error: ${response.status}. Make sure you are using an Anthropic key (sk-ant-…).`);
       const data = await response.json();
       return data.content?.[0]?.text || 'No response.';
+    }
+
+    if (isGoogle) {
+      // Google Generative Language API (Gemini / Gemma via Google AI Studio)
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const contents = [
+        ...messages.map(m => ({
+          role: m.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: m.content }],
+        })),
+        { role: 'user', parts: [{ text: message }] },
+      ];
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents,
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          generationConfig: { maxOutputTokens: 500, temperature: 0.7 },
+        }),
+      });
+      if (!response.ok) {
+        const hint = response.status === 401 || response.status === 403
+          ? ' Make sure you are using a Google AI Studio key (AIzaSy…).'
+          : response.status === 400
+          ? ' Check that the model name is correct (e.g. gemini-2.0-flash).'
+          : '';
+        throw new Error(`Google AI API error: ${response.status}.${hint}`);
+      }
+      const data = await response.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response.';
     }
 
     // OpenAI-compatible
@@ -356,7 +388,12 @@ Keep responses concise (2-3 sentences max).`;
         max_tokens: 500,
       }),
     });
-    if (!response.ok) throw new Error(`OpenAI API error: ${response.status}`);
+    if (!response.ok) {
+      const hint = response.status === 401
+        ? ' Make sure you are using an OpenAI key (sk-…). For Google Gemini/Gemma, select a Gemini model and use your Google AI Studio key (AIzaSy…).'
+        : '';
+      throw new Error(`OpenAI API error: ${response.status}.${hint}`);
+    }
     const data = await response.json();
     return data.choices?.[0]?.message?.content || 'No response.';
   };
@@ -416,7 +453,7 @@ Keep responses concise (2-3 sentences max).`;
       addLog('chat', 'error', `LLM Error: ${msg}`);
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `Sorry, I encountered an error: ${msg}. Make sure Ollama is running (ollama serve) or check your API key in Settings.`,
+        content: `Sorry, I encountered an error: ${msg}\n\n**Troubleshooting tips:**\n- Using a **Google key (AIzaSy…)**? Make sure you selected a Gemini or Gemma model in ⚙️ Settings → External Model.\n- Using an **OpenAI key (sk-…)**? Select a GPT model in Settings.\n- Using an **Anthropic key (sk-ant-…)**? Select a Claude model.\n- No key set? Make sure Ollama is running: \`ollama serve\``,
       }]);
     } finally {
       setIsLoading(false);
@@ -1113,6 +1150,8 @@ Perfect for non-technical users who want to automate their workflows!
                   <option value="phi3">phi3 (Phi-3 Mini)</option>
                   <option value="phi3:medium">phi3:medium</option>
                   <option value="mistral">mistral</option>
+                  <option value="gemma2:2b">gemma2:2b (Gemma 2 2B – local, free)</option>
+                  <option value="gemma2">gemma2 (Gemma 2 9B)</option>
                 </select>
                 <p className="setting-description">
                   Used offline when no external API key is set. Pull with: <code>ollama pull {localModel}</code>
@@ -1137,10 +1176,10 @@ Perfect for non-technical users who want to automate their workflows!
                 If an API key is set, the external model is used instead of the local one.
               </p>
               <div className="api-key-input">
-                <label>API Key (OpenAI / Anthropic)</label>
+                <label>API Key (OpenAI / Anthropic / Google)</label>
                 <input
                   type="password"
-                  placeholder="sk-… (OpenAI) or sk-ant-… (Anthropic)"
+                  placeholder="sk-… (OpenAI), sk-ant-… (Anthropic), or AIzaSy… (Google)"
                   defaultValue={localStorage.getItem('llm_api_key') || ''}
                   onChange={e => {
                     if (e.target.value) {
@@ -1154,6 +1193,9 @@ Perfect for non-technical users who want to automate their workflows!
                     }
                   }}
                 />
+                <p className="setting-description" style={{ marginTop: '4px' }}>
+                  🔑 Key format: <strong>sk-…</strong> for OpenAI · <strong>sk-ant-…</strong> for Anthropic · <strong>AIzaSy…</strong> for Google (Gemini/Gemma)
+                </p>
               </div>
               <div className="api-key-input">
                 <label>External Model</label>
@@ -1164,12 +1206,26 @@ Perfect for non-technical users who want to automate their workflows!
                     addLog('system', 'info', `External model switched to ${e.target.value}`);
                   }}
                 >
-                  <option value="gpt-4">GPT-4 (OpenAI)</option>
-                  <option value="gpt-4o">GPT-4o (OpenAI)</option>
-                  <option value="gpt-3.5-turbo">GPT-3.5 Turbo (OpenAI)</option>
-                  <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet (Anthropic)</option>
-                  <option value="claude-3-opus-20240229">Claude 3 Opus (Anthropic)</option>
+                  <optgroup label="OpenAI">
+                    <option value="gpt-4">GPT-4 (OpenAI)</option>
+                    <option value="gpt-4o">GPT-4o (OpenAI)</option>
+                    <option value="gpt-3.5-turbo">GPT-3.5 Turbo (OpenAI)</option>
+                  </optgroup>
+                  <optgroup label="Anthropic">
+                    <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet (Anthropic)</option>
+                    <option value="claude-3-opus-20240229">Claude 3 Opus (Anthropic)</option>
+                  </optgroup>
+                  <optgroup label="Google AI (requires Google AI Studio key: AIzaSy…)">
+                    <option value="gemini-2.0-flash">Gemini 2.0 Flash (Google)</option>
+                    <option value="gemini-1.5-pro">Gemini 1.5 Pro (Google)</option>
+                    <option value="gemini-1.5-flash">Gemini 1.5 Flash (Google)</option>
+                    <option value="gemma-2-2b-it">Gemma 2 2B – cloud API (Google AI)</option>
+                    <option value="gemma-2-9b-it">Gemma 2 9B – cloud API (Google AI)</option>
+                  </optgroup>
                 </select>
+                <p className="setting-description" style={{ marginTop: '4px' }}>
+                  💡 <strong>Cloud Gemma</strong> (above) uses your Google AI Studio key. For <strong>local Gemma</strong> (free, no key), go to Local AI Model and run: <code>ollama pull gemma2:2b</code>
+                </p>
               </div>
             </div>
 

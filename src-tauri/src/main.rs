@@ -128,6 +128,7 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
     let mut history = req.history;
     history.push(OllamaMessage { role: "user".to_string(), content: req.message.clone() });
 
+    let is_google = req.model.starts_with("gemini") || req.model.starts_with("gemma");
     let response_text = if req.model.contains("claude") {
         // Anthropic Claude API
         let messages: Vec<serde_json::Value> = history.iter().map(|m| {
@@ -152,12 +153,65 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
             .map_err(|e| format!("Anthropic request failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Anthropic API error: {}", resp.status()));
+            return Err(format!("Anthropic API error: {}. Make sure you are using an Anthropic key (sk-ant-…).", resp.status()));
         }
 
         let data: serde_json::Value = resp.json().await
             .map_err(|e| format!("Failed to parse Anthropic response: {e}"))?;
         data["content"][0]["text"]
+            .as_str()
+            .unwrap_or("No response.")
+            .to_string()
+    } else if is_google {
+        // Google Generative Language API (Gemini / Gemma)
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            req.model, req.api_key
+        );
+
+        // Build conversation contents; Gemini uses "user"/"model" roles
+        let contents: Vec<serde_json::Value> = history.iter().map(|m| {
+            let role = if m.role == "assistant" { "model" } else { "user" };
+            serde_json::json!({
+                "role": role,
+                "parts": [{"text": m.content}]
+            })
+        }).collect();
+
+        let body = serde_json::json!({
+            "contents": contents,
+            "systemInstruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "generationConfig": {
+                "maxOutputTokens": 500,
+                "temperature": 0.7
+            }
+        });
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Google AI request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let hint = if status.as_u16() == 400 {
+                " — Check that the model name is correct (e.g. gemini-2.0-flash, gemma-2-2b-it)."
+            } else if status.as_u16() == 401 || status.as_u16() == 403 {
+                " — Your Google AI Studio key (AIzaSy…) may be invalid or restricted."
+            } else {
+                ""
+            };
+            return Err(format!("Google AI API error: {}{}", status, hint));
+        }
+
+        let data: serde_json::Value = resp.json().await
+            .map_err(|e| format!("Failed to parse Google AI response: {e}"))?;
+        data["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
             .unwrap_or("No response.")
             .to_string()
@@ -186,7 +240,13 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
             .map_err(|e| format!("OpenAI request failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("OpenAI API error: {}", resp.status()));
+            let status = resp.status();
+            let hint = if status.as_u16() == 401 {
+                " — Make sure you are using an OpenAI key (sk-…). If you want to use Google Gemini, select a Gemini model and enter your Google AI Studio key (AIzaSy…)."
+            } else {
+                ""
+            };
+            return Err(format!("OpenAI API error: {}{}", status, hint));
         }
 
         let data: serde_json::Value = resp.json().await
@@ -198,7 +258,9 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
     };
 
     // Log LLM usage to SQLite
-    let provider = if req.model.contains("claude") { "anthropic" } else { "openai" };
+    let provider = if req.model.contains("claude") { "anthropic" }
+                   else if is_google { "google" }
+                   else { "openai" };
     let ctx = req.context.unwrap_or_default();
     let _ = db::record_llm_usage(provider, &req.model, &ctx, &Utc::now().to_rfc3339());
 

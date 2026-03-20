@@ -7,6 +7,92 @@ A UI-first desktop automation assistant powered by **local AI (Llama 3 / Phi-3)*
 
 ---
 
+## ⚡ Copy-Paste Setup Commands
+
+> Run these in order from the project root after cloning. Pick the block that matches your OS.
+
+### macOS / Linux
+
+```bash
+# 1. Install Rust (skip if already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# 2. Install Tauri system libraries (Linux only – skip on macOS)
+sudo apt-get update -y && sudo apt-get install -y \
+  libwebkit2gtk-4.1-dev build-essential curl wget file \
+  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+# 3. Install Python + Playwright browser driver
+pip3 install playwright
+playwright install chromium
+
+# 4. Install Node dependencies
+npm install
+
+# 5. Install OpenClaw CLI
+npm install -g openclaw
+
+# 6a. Run in development mode
+npm run tauri dev
+
+# 6b. OR build a production installer
+npm run tauri build
+```
+
+**One-shot script** (steps 1–5 + confirmation):
+
+```bash
+bash setup.sh
+```
+
+---
+
+### Windows (PowerShell – run as Administrator)
+
+```powershell
+# Allow script execution for this session
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+# 1. Install Rust (skip if already installed)
+Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile "$env:TEMP\rustup-init.exe"
+& "$env:TEMP\rustup-init.exe" -y
+$env:PATH += ";$env:USERPROFILE\.cargo\bin"
+
+# 2. Install Python + Playwright browser driver
+pip install playwright
+playwright install chromium
+
+# 3. Install Node dependencies
+npm install
+
+# 4. Install OpenClaw CLI
+npm install -g openclaw
+
+# 5a. Run in development mode
+npm run tauri dev
+
+# 5b. OR build a production installer
+npm run tauri build
+```
+
+**One-shot script** (steps 1–4 + confirmation):
+
+```powershell
+.\setup.ps1
+```
+
+---
+
+> **Prerequisites** (install manually before running the above if not present):
+> | Tool | Download |
+> |------|----------|
+> | Node.js 18+ | https://nodejs.org |
+> | Python 3.9+ | https://python.org |
+> | Rust / Cargo | https://rustup.rs (or via `winget install Rustlang.Rustup` on Windows) |
+
+---
+
 ## ✨ Features
 
 - **Chat-First Interface** – create automation agents by chatting (type "create agent" or just describe your task)

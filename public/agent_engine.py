@@ -287,38 +287,75 @@ class AgentEngine:
     # LinkedIn: comment on hashtag posts
     # ------------------------------------------------------------------
 
+    # Pixels to scroll per pass when loading lazy-loaded feed content.
+    _SCROLL_AMOUNT_PX: int = 900
+    # Milliseconds to wait after each scroll pass (allows network + DOM to settle).
+    _SCROLL_WAIT_MS: int = 2000
+
     # LinkedIn comment-button selectors in priority order.
     # LinkedIn frequently changes class names; we keep a broad list so at
-    # least one variant matches across UI versions.
+    # least one variant matches across UI versions (2024/2025 UI included).
     _COMMENT_BTN_SELECTORS = [
+        # ARIA-label based — most stable across LinkedIn UI versions
         "button[aria-label*='Comment' i]",
+        # 2024/2025: artdeco-button components with aria-label
+        ".artdeco-button[aria-label*='Comment' i]",
+        # Specific common aria-labels LinkedIn uses
+        "button[aria-label='Comment on this post']",
+        "button[aria-label='Comment']",
+        # Data control name (still present in some layouts)
         "button[data-control-name='comment']",
+        # Class-based (may vary between LinkedIn UI versions)
         "button.comment-button",
         ".social-action-bar__action-btn--comment",
         ".feed-shared-social-action-bar__action-button[aria-label*='comment' i]",
         "li.social-action-button--comment button",
+        # Social action bar generic selectors
         ".social-actions button:has-text('Comment')",
+        ".social-action-bar button:has-text('Comment')",
+        # SVG icon-based detection (LinkedIn uses SVG icons in artdeco buttons)
+        "button:has(svg[data-test-icon='comment-medium'])",
+        # Broad text fallback
         "button:has-text('Comment')",
     ]
 
     # Comment editor selectors tried in order after the comment box opens.
+    # LinkedIn 2024/2025 uses contenteditable divs; class names vary.
     _REPLY_BOX_SELECTORS = [
+        # Most specific — scoped to comment box container
         ".comments-comment-box .ql-editor",
         ".comments-comment-texteditor .ql-editor",
         ".comments-comment-box [contenteditable='true']",
+        # 2024/2025 editor-content div
+        "div.editor-content[contenteditable='true']",
+        # Role-based (accessible in all LinkedIn UI versions)
+        "[contenteditable='true'][role='textbox']",
+        # Placeholder-based (most reliable user-visible text anchor)
         "[contenteditable='true'][data-placeholder*='Add a comment' i]",
         "[contenteditable='true'][data-placeholder*='comment' i]",
+        # Comment reply forms
+        ".comments-reply-compose-box [contenteditable='true']",
+        ".comments-reply-compose-box .ql-editor",
+        # Scoped ql-editor
         ".ql-editor",
+        # Last resort — any visible contenteditable
+        "[contenteditable='true']",
     ]
 
     # Submit-button selectors tried in order.
     _SUBMIT_BTN_SELECTORS = [
         "button.comments-comment-box__submit-button",
+        # 2024/2025 variant class suffix
+        "button.comments-comment-box__submit-button--cr",
         "button[aria-label='Post comment']",
         "button[aria-label*='Post comment' i]",
+        "button[data-control-name='comment.submit']",
         ".comments-comment-box button[type='submit']",
         "form.comments-comment-box button:has-text('Post')",
         "button:has-text('Post comment')",
+        # 2024/2025: artdeco Post button inside comment box
+        ".comments-comment-box .artdeco-button--primary",
+        ".comments-comment-box button[aria-label*='Post' i]",
     ]
 
     def _find_comment_buttons(self, page: "Page") -> "Locator":
@@ -344,11 +381,45 @@ class AgentEngine:
         self.log("warning", "⚠️  No individual selector matched; falling back to combined selector.")
         return page.locator(combined)
 
+    # Indicators that LinkedIn is rate-limiting or blocking the session.
+    _BLOCK_INDICATORS = [
+        "challenge",
+        "checkpoint",
+        "captcha",
+        "authwall",
+        "security-verification",
+        "in/unavailable",
+    ]
+
+    def _check_blocked(self, page: "Page") -> bool:
+        """Return True and log a warning if LinkedIn has redirected to a block/challenge page."""
+        url = page.url.lower()
+        title = ""
+        try:
+            title = page.title().lower()
+        except Exception:
+            pass
+
+        for indicator in self._BLOCK_INDICATORS:
+            if indicator in url or indicator in title:
+                self.log(
+                    "warning",
+                    f"🚫 LinkedIn rate-limit or security check detected. "
+                    f"URL: {page.url!r} | Title: {page.title()!r}. "
+                    "Wait a few minutes and re-run, or complete the challenge manually.",
+                )
+                return True
+        return False
+
     def _navigate_to_hashtag_feed(self, page: "Page", hashtag: str) -> bool:
         """Navigate to the LinkedIn hashtag feed, trying two URLs.
 
         Returns True if the feed loaded successfully (user is logged in and
-        posts are likely available), False if the user needs to log in.
+        posts are likely available), False if the user needs to log in or is blocked.
+
+        Note: This method intentionally does NOT check for comment buttons
+        before scrolling — LinkedIn lazy-loads all feed content, so buttons
+        won't be present until after the page has been scrolled.
         """
         tag = hashtag.lower().lstrip("#")
 
@@ -358,28 +429,63 @@ class AgentEngine:
         page.goto(primary_url, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
 
+        self.log("info", f"📄 Page after navigation — URL: {page.url!r} | Title: {page.title()!r}")
+
         if "login" in page.url or "signup" in page.url:
-            self.log("warning", "⚠️  Not logged in (redirected to login). Please log in and re-run.")
+            self.log(
+                "warning",
+                "⚠️  Not logged in (redirected to login/signup). "
+                "Open the browser profile, log in to LinkedIn, then re-run.",
+            )
             page.wait_for_timeout(60000)
             return False
 
-        # If the hashtag feed loaded but appears empty, fall back to search URL
-        # which is more reliable across LinkedIn UI versions.
-        initial_count = page.locator(", ".join(self._COMMENT_BTN_SELECTORS)).count()
-        if initial_count == 0:
-            self.log("info", "ℹ️  No comment buttons on hashtag feed; trying search URL…")
-            search_url = (
-                f"https://www.linkedin.com/search/results/content/"
-                f"?keywords=%23{tag}&origin=SWITCH_SEARCH_VERTICAL"
-            )
-            self.log("info", f"📍 Navigating to search feed: {search_url}")
-            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
+        if self._check_blocked(page):
+            return False
 
-            if "login" in page.url or "signup" in page.url:
-                self.log("warning", "⚠️  Not logged in (redirected to login). Please log in and re-run.")
-                page.wait_for_timeout(60000)
-                return False
+        # If the hashtag page appears to have no content (e.g. LinkedIn redirected
+        # to an empty state), fall back to the content-search URL which is more
+        # reliable across LinkedIn UI versions and exposes posts even for
+        # low-volume hashtags.
+        no_content_indicators = [
+            "no results",
+            "no posts",
+            "nothing matches",
+        ]
+        page_text = ""
+        try:
+            page_text = page.locator("body").inner_text(timeout=3000).lower()
+        except Exception:
+            pass
+
+        has_no_content = any(ind in page_text for ind in no_content_indicators)
+
+        if has_no_content:
+            self.log("info", "ℹ️  Hashtag feed appears empty; falling back to content-search URL…")
+
+        # Always try the search URL as well: it surfaces posts for low-volume
+        # hashtags that don't have a dedicated feed page.
+        search_url = (
+            f"https://www.linkedin.com/search/results/content/"
+            f"?keywords=%23{tag}&origin=SWITCH_SEARCH_VERTICAL"
+        )
+        self.log("info", f"📍 Also trying search URL: {search_url}")
+        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(3000)
+
+        self.log("info", f"📄 Search page — URL: {page.url!r} | Title: {page.title()!r}")
+
+        if "login" in page.url or "signup" in page.url:
+            self.log(
+                "warning",
+                "⚠️  Not logged in (redirected to login/signup). "
+                "Open the browser profile, log in to LinkedIn, then re-run.",
+            )
+            page.wait_for_timeout(60000)
+            return False
+
+        if self._check_blocked(page):
+            return False
 
         return True
 
@@ -420,24 +526,65 @@ class AgentEngine:
                     ctx.close()
                     return 0
 
-                # Scroll to trigger lazy-loaded posts
+                # Scroll to trigger lazy-loaded posts.
+                # LinkedIn lazy-loads feed content; we scroll in multiple short
+                # passes and wait between each to give the network requests time
+                # to complete and the DOM to update.
                 self.log("info", "📜 Scrolling feed to load posts…")
-                for _ in range(3):
-                    page.evaluate("window.scrollBy(0, 800)")
-                    page.wait_for_timeout(1500)
+                for scroll_pass in range(5):
+                    page.evaluate(f"window.scrollBy(0, {self._SCROLL_AMOUNT_PX})")
+                    page.wait_for_timeout(self._SCROLL_WAIT_MS)
+                    btn_count_mid = page.locator(", ".join(self._COMMENT_BTN_SELECTORS)).count()
+                    self.log(
+                        "info",
+                        f"  Scroll pass {scroll_pass + 1}/5 — comment buttons visible so far: {btn_count_mid}",
+                    )
+                    if btn_count_mid >= max_posts:
+                        self.log("info", "  Found enough buttons; stopping early.")
+                        break
+
+                # Check for rate limiting / block again after scrolling
+                if self._check_blocked(page):
+                    ctx.close()
+                    return 0
+
+                # Diagnostic: log post containers found on the page
+                post_container_selectors = [
+                    ".feed-shared-update-v2",
+                    ".search-result__occluded-item",
+                    "div[data-urn]",
+                    "article",
+                    ".entity-result",
+                ]
+                for pc_sel in post_container_selectors:
+                    pc_count = page.locator(pc_sel).count()
+                    if pc_count > 0:
+                        self.log("info", f"📦 Post containers via {pc_sel!r}: {pc_count} found")
+                        break
+                else:
+                    self.log(
+                        "warning",
+                        "⚠️  No post container elements found. "
+                        "The page may not have loaded correctly or the hashtag has no posts. "
+                        f"URL: {page.url!r} | Title: {page.title()!r}",
+                    )
 
                 # Wait for at least one comment button to appear
                 self.log("info", "🔍 Waiting for comment buttons to appear…")
                 try:
                     combined_sel = ", ".join(self._COMMENT_BTN_SELECTORS)
-                    page.wait_for_selector(combined_sel, timeout=10000)
+                    page.wait_for_selector(combined_sel, timeout=12000)
                 except Exception:
-                    self.log("warning", (
+                    self.log(
+                        "warning",
                         "⚠️  No comment buttons found after scrolling. "
                         f"Current URL: {page.url!r}  |  Page title: {page.title()!r}. "
-                        "Possible causes: not logged in, LinkedIn UI changed, "
-                        "or no posts with this hashtag are currently visible."
-                    ))
+                        "Possible causes: (1) not logged in to LinkedIn, "
+                        "(2) LinkedIn UI selectors changed, "
+                        "(3) the hashtag has no posts visible, "
+                        "(4) rate limiting or CAPTCHA challenge. "
+                        "Try opening the browser profile manually to verify the page.",
+                    )
                     ctx.close()
                     return 0
 
@@ -446,10 +593,12 @@ class AgentEngine:
                 self.log("info", f"Found {count} comment button(s) on the page")
 
                 if count == 0:
-                    self.log("warning", (
-                        "⚠️  0 comment buttons found. "
-                        f"URL: {page.url!r} | Title: {page.title()!r}"
-                    ))
+                    self.log(
+                        "warning",
+                        "⚠️  0 comment buttons found after wait_for_selector succeeded. "
+                        f"URL: {page.url!r} | Title: {page.title()!r}. "
+                        "This is unexpected — LinkedIn may have changed its DOM structure.",
+                    )
                     ctx.close()
                     return 0
 
@@ -458,26 +607,59 @@ class AgentEngine:
                         btn = comment_buttons.nth(i)
                         btn.scroll_into_view_if_needed()
                         btn.click(timeout=8000)
-                        page.wait_for_timeout(1500)
+                        page.wait_for_timeout(2000)
 
-                        # Wait for the comment editor to appear, then type
+                        # Wait for the comment editor to appear, then type.
+                        # We try multiple selectors; for contenteditable elements
+                        # we use fill() (or keyboard typing) because .type() can
+                        # fail silently if focus is not properly acquired.
                         reply_box = None
+                        reply_box_sel_used = None
                         for sel in self._REPLY_BOX_SELECTORS:
                             try:
                                 loc = page.locator(sel).last
                                 if loc.count() > 0:
                                     loc.wait_for(state="visible", timeout=5000)
                                     reply_box = loc
+                                    reply_box_sel_used = sel
                                     break
                             except Exception:
                                 continue
 
                         if reply_box is None:
-                            self.log("warning", f"⚠️  Could not find comment editor for post {i + 1}; skipping.")
+                            self.log(
+                                "warning",
+                                f"⚠️  Could not find comment editor for post {i + 1}; skipping. "
+                                "All reply-box selectors exhausted.",
+                            )
                             continue
 
-                        reply_box.click()
-                        reply_box.type(comment_text, delay=15)
+                        self.log("info", f"✏️  Using reply-box selector: {reply_box_sel_used!r}")
+                        reply_box.scroll_into_view_if_needed()
+                        reply_box.click(force=True)
+                        page.wait_for_timeout(500)
+
+                        # Prefer fill() for contenteditable; fall back to keyboard type
+                        typed = False
+                        try:
+                            reply_box.fill(comment_text)
+                            typed = True
+                        except Exception:
+                            pass
+
+                        if not typed:
+                            try:
+                                # Select all existing text and replace
+                                reply_box.press("Control+a")
+                                page.keyboard.type(comment_text, delay=15)
+                                typed = True
+                            except Exception as te:
+                                self.log("warning", f"⚠️  Keyboard type also failed for post {i + 1}: {te}")
+
+                        if not typed:
+                            self.log("warning", f"⚠️  Could not type comment for post {i + 1}; skipping.")
+                            continue
+
                         page.wait_for_timeout(800)
 
                         # Find and click the submit button
@@ -486,17 +668,23 @@ class AgentEngine:
                             try:
                                 sub_btn = page.locator(sel).last
                                 if sub_btn.count() > 0:
+                                    sub_btn.scroll_into_view_if_needed()
                                     sub_btn.click(timeout=8000)
                                     submitted = True
+                                    self.log("info", f"📤 Submitted via selector: {sel!r}")
                                     break
                             except Exception:
                                 continue
 
                         if not submitted:
-                            self.log("warning", f"⚠️  Could not find submit button for post {i + 1}; skipping.")
+                            self.log(
+                                "warning",
+                                f"⚠️  Could not find submit button for post {i + 1}; skipping. "
+                                "All submit-button selectors exhausted.",
+                            )
                             continue
 
-                        page.wait_for_timeout(2000)
+                        page.wait_for_timeout(2500)
                         commented += 1
                         self.log("success", f"✅ Commented on post {i + 1}")
                     except Exception as exc:

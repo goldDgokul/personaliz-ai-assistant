@@ -12,11 +12,18 @@ def run_hashtag_agent(hashtag="AI"):
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
 
-        # Try the dedicated hashtag feed first, then fall back to search results.
+        tag = hashtag.lower().lstrip('#')
+
+        # Navigate directly to the Posts-only content search URL.
+        # search/results/content/ is the 'Posts' tab — it filters out people,
+        # jobs, and companies, ensuring we only see commentable post cards.
+        # Previously the script first tried feed/hashtag/ which LinkedIn can
+        # redirect to search/results/all/ (general results), yielding no posts.
         primary_url = (
-            f"https://www.linkedin.com/feed/hashtag/{hashtag.lower().lstrip('#')}/"
+            f"https://www.linkedin.com/search/results/content/"
+            f"?keywords=%23{tag}&origin=SWITCH_SEARCH_VERTICAL"
         )
-        print(f"[hashtag_agent] Navigating to: {primary_url}")
+        print(f"[hashtag_agent] Navigating to Posts search (Posts tab): {primary_url}")
         page.goto(primary_url)
         page.wait_for_timeout(3000)
         print(f"[hashtag_agent] Page URL after navigation: {page.url!r}")
@@ -40,23 +47,35 @@ def run_hashtag_agent(hashtag="AI"):
             browser.close()
             return
 
-        # Fall back to content-search URL (more reliable for low-volume hashtags)
-        search_url = (
-            f"https://www.linkedin.com/search/results/content/"
-            f"?keywords=%23{hashtag.lower().lstrip('#')}&origin=SWITCH_SEARCH_VERTICAL"
-        )
-        print(f"[hashtag_agent] Also trying search URL: {search_url}")
-        page.goto(search_url)
-        page.wait_for_timeout(3000)
-        print(f"[hashtag_agent] Page URL: {page.url!r} | Title: {page.title()!r}")
-
-        if "login" in page.url or "signup" in page.url:
+        # Detect if LinkedIn redirected to the general 'all' results page instead
+        # of the Posts-only 'content' results page.  Fall back to the dedicated
+        # hashtag feed URL in that case.
+        if "search/results/all" in page.url or "search/results/content" not in page.url:
             print(
-                "[hashtag_agent] WARNING: Not logged in. "
-                "Open the browser, log in to LinkedIn, then re-run."
+                f"[hashtag_agent] WARNING: Expected Posts-only page (search/results/content/) "
+                f"but got: {page.url!r}. Trying hashtag feed as fallback."
             )
-            browser.close()
-            return
+            fallback_url = f"https://www.linkedin.com/feed/hashtag/{tag}/"
+            print(f"[hashtag_agent] Navigating to fallback: {fallback_url}")
+            page.goto(fallback_url)
+            page.wait_for_timeout(3000)
+            print(f"[hashtag_agent] Fallback Page URL: {page.url!r} | Title: {page.title()!r}")
+
+            if "login" in page.url or "signup" in page.url:
+                print(
+                    "[hashtag_agent] WARNING: Not logged in. "
+                    "Open the browser, log in to LinkedIn, then re-run."
+                )
+                browser.close()
+                return
+
+            if any(ind in page.url.lower() for ind in block_indicators):
+                print(
+                    f"[hashtag_agent] WARNING: LinkedIn security/rate-limit page detected. "
+                    f"URL: {page.url!r}. Wait a few minutes and re-run."
+                )
+                browser.close()
+                return
 
         # Scroll to trigger lazy-loaded posts (LinkedIn doesn't render posts
         # until they are scrolled into the viewport).
@@ -102,8 +121,13 @@ def run_hashtag_agent(hashtag="AI"):
                 continue
 
         if not clicked:
-            # Log what is on the page for diagnostics
+            # Log what is on the page for diagnostics.
+            # On search/results/content/ (Posts tab) LinkedIn wraps each result in
+            # 'reusable-search__result-container'; on the hashtag feed it uses
+            # 'feed-shared-update-v2'.  We check both sets for useful diagnostics.
             post_containers = [
+                "li.reusable-search__result-container",
+                ".reusable-search__result-container",
                 ".feed-shared-update-v2",
                 "div[data-urn]",
                 ".entity-result",
@@ -123,7 +147,9 @@ def run_hashtag_agent(hashtag="AI"):
                 print(
                     f"[hashtag_agent] WARNING: No post containers or comment buttons found. "
                     f"URL: {page.url!r} | Title: {page.title()!r}. "
-                    "Possible causes: not logged in, empty hashtag, or LinkedIn UI change."
+                    "Possible causes: (1) not logged in, (2) empty hashtag, "
+                    "(3) LinkedIn UI change, (4) wrong results page loaded "
+                    "(expected search/results/content/ for Posts-only tab)."
                 )
             browser.close()
             return

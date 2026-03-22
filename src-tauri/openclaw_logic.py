@@ -37,7 +37,7 @@ def execute_browser_task(mode, content, task_type):
                     print(f"SANDBOX: Content typed but not submitted: {content}")
 
             elif "hashtag" in task_type:
-                print(f"[{mode}] Searching #OpenClaw...")
+                print(f"[{mode}] Searching #OpenClaw posts (Posts tab)...")
                 page.goto(
                     "https://www.linkedin.com/search/results/content/"
                     "?keywords=%23OpenClaw&origin=SWITCH_SEARCH_VERTICAL"
@@ -50,6 +50,12 @@ def execute_browser_task(mode, content, task_type):
                     print(f"[{mode}] WARNING: Not logged in. Open the browser, log in, then re-run.")
                 elif any(ind in page.url.lower() for ind in ("challenge", "checkpoint", "captcha")):
                     print(f"[{mode}] WARNING: LinkedIn rate-limit/challenge page detected: {page.url!r}")
+                elif "search/results/all" in page.url or "search/results/content" not in page.url:
+                    print(
+                        f"[{mode}] WARNING: Expected Posts-only page (search/results/content/) "
+                        f"but got: {page.url!r}. "
+                        "LinkedIn may have redirected to general 'All' results — no commentable posts will be found."
+                    )
                 else:
                     # Scroll to trigger lazy-loaded posts (5 passes for reliability)
                     for scroll_pass in range(5):
@@ -91,8 +97,18 @@ def execute_browser_task(mode, content, task_type):
                             continue
 
                     if not clicked:
-                        # Log diagnostics so user can debug
-                        for pc_sel in (".feed-shared-update-v2", "div[data-urn]", ".entity-result", "article"):
+                        # Log diagnostics so user can debug.
+                        # On search/results/content/ (Posts tab) LinkedIn wraps results in
+                        # 'reusable-search__result-container'; on the hashtag feed it uses
+                        # 'feed-shared-update-v2'.  We check both for useful diagnostics.
+                        for pc_sel in (
+                            "li.reusable-search__result-container",
+                            ".reusable-search__result-container",
+                            ".feed-shared-update-v2",
+                            "div[data-urn]",
+                            ".entity-result",
+                            "article",
+                        ):
                             n = page.locator(pc_sel).count()
                             if n > 0:
                                 print(
@@ -103,7 +119,9 @@ def execute_browser_task(mode, content, task_type):
                         else:
                             print(
                                 f"[{mode}] WARNING: No post containers or comment buttons found. "
-                                f"URL: {page.url!r} | Title: {page.title()!r}"
+                                f"URL: {page.url!r} | Title: {page.title()!r}. "
+                                "Possible causes: (1) not logged in, (2) empty hashtag, "
+                                "(3) LinkedIn UI change, (4) wrong results page loaded."
                             )
                     else:
                         page.wait_for_timeout(2000)

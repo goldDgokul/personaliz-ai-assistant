@@ -412,70 +412,34 @@ class AgentEngine:
         return False
 
     def _navigate_to_hashtag_feed(self, page: "Page", hashtag: str) -> bool:
-        """Navigate to the LinkedIn hashtag feed, trying two URLs.
+        """Navigate to the LinkedIn hashtag Posts-only search page.
+
+        Goes directly to the 'Posts' tab (search/results/content/) to avoid
+        the general 'All' results page which does not contain commentable posts.
+        If LinkedIn redirects to the general search or an empty state, the
+        dedicated hashtag feed is tried as a fallback.
 
         Returns True if the feed loaded successfully (user is logged in and
         posts are likely available), False if the user needs to log in or is blocked.
-
-        Note: This method intentionally does NOT check for comment buttons
-        before scrolling — LinkedIn lazy-loads all feed content, so buttons
-        won't be present until after the page has been scrolled.
         """
         tag = hashtag.lower().lstrip("#")
 
-        # Primary: dedicated hashtag feed
-        primary_url = f"https://www.linkedin.com/feed/hashtag/{tag}/"
-        self.log("info", f"📍 Navigating to hashtag feed: {primary_url}")
-        page.goto(primary_url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(3000)
-
-        self.log("info", f"📄 Page after navigation — URL: {page.url!r} | Title: {page.title()!r}")
-
-        if "login" in page.url or "signup" in page.url:
-            self.log(
-                "warning",
-                "⚠️  Not logged in (redirected to login/signup). "
-                "Open the browser profile, log in to LinkedIn, then re-run.",
-            )
-            page.wait_for_timeout(60000)
-            return False
-
-        if self._check_blocked(page):
-            return False
-
-        # If the hashtag page appears to have no content (e.g. LinkedIn redirected
-        # to an empty state), fall back to the content-search URL which is more
-        # reliable across LinkedIn UI versions and exposes posts even for
-        # low-volume hashtags.
-        no_content_indicators = [
-            "no results",
-            "no posts",
-            "nothing matches",
-        ]
-        page_text = ""
-        try:
-            page_text = page.locator("body").inner_text(timeout=3000).lower()
-        except Exception:
-            pass
-
-        has_no_content = any(ind in page_text for ind in no_content_indicators)
-
-        if has_no_content:
-            self.log("info", "ℹ️  Hashtag feed appears empty; falling back to content-search URL…")
-
-        # Always try the search URL as well: it surfaces posts for low-volume
-        # hashtags that don't have a dedicated feed page.
+        # Navigate directly to the Posts-only content search URL.
+        # Using search/results/content/ ensures we land on the 'Posts' tab,
+        # not the general 'All' results page that mixes people/jobs/companies
+        # and yields no comment buttons.
         search_url = (
             f"https://www.linkedin.com/search/results/content/"
             f"?keywords=%23{tag}&origin=SWITCH_SEARCH_VERTICAL"
         )
-        self.log("info", f"📍 Also trying search URL: {search_url}")
+        self.log("info", f"📍 Navigating to LinkedIn Posts search (Posts tab): {search_url}")
         page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
 
-        self.log("info", f"📄 Search page — URL: {page.url!r} | Title: {page.title()!r}")
+        current_url = page.url
+        self.log("info", f"📄 Page after navigation — URL: {current_url!r} | Title: {page.title()!r}")
 
-        if "login" in page.url or "signup" in page.url:
+        if "login" in current_url or "signup" in current_url:
             self.log(
                 "warning",
                 "⚠️  Not logged in (redirected to login/signup). "
@@ -486,6 +450,37 @@ class AgentEngine:
 
         if self._check_blocked(page):
             return False
+
+        # Detect if LinkedIn redirected to the general 'all' results page instead
+        # of the Posts-only 'content' results page.  When this happens the DOM
+        # contains no commentable post cards, so we fall back to the dedicated
+        # hashtag feed URL.
+        if "search/results/all" in current_url or "search/results/content" not in current_url:
+            self.log(
+                "warning",
+                "⚠️  Expected Posts-only results page (search/results/content/) but got a "
+                f"different URL: {current_url!r}. "
+                "LinkedIn may have redirected to the general 'All' results — trying the "
+                "dedicated hashtag feed as fallback.",
+            )
+            fallback_url = f"https://www.linkedin.com/feed/hashtag/{tag}/"
+            self.log("info", f"📍 Trying hashtag feed fallback: {fallback_url}")
+            page.goto(fallback_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+            current_url = page.url
+            self.log("info", f"📄 Fallback page — URL: {current_url!r} | Title: {page.title()!r}")
+
+            if "login" in current_url or "signup" in current_url:
+                self.log(
+                    "warning",
+                    "⚠️  Still redirected to login/signup after fallback. "
+                    "Open the browser profile, log in to LinkedIn, then re-run.",
+                )
+                page.wait_for_timeout(60000)
+                return False
+
+            if self._check_blocked(page):
+                return False
 
         return True
 
@@ -548,24 +543,38 @@ class AgentEngine:
                     ctx.close()
                     return 0
 
-                # Diagnostic: log post containers found on the page
+                # Diagnostic: log post containers found on the page.
+                # On search/results/content/ (Posts tab) LinkedIn wraps each result in
+                # 'reusable-search__result-container'; on the hashtag feed it uses
+                # 'feed-shared-update-v2'.  We check both sets so the log is useful
+                # regardless of which page we ended up on.
                 post_container_selectors = [
+                    # Posts tab search results (search/results/content/)
+                    "li.reusable-search__result-container",
+                    ".reusable-search__result-container",
+                    # Hashtag feed and general feed
                     ".feed-shared-update-v2",
                     ".search-result__occluded-item",
+                    # Generic fallbacks
                     "div[data-urn]",
                     "article",
                     ".entity-result",
                 ]
+                found_any_container = False
                 for pc_sel in post_container_selectors:
                     pc_count = page.locator(pc_sel).count()
                     if pc_count > 0:
                         self.log("info", f"📦 Post containers via {pc_sel!r}: {pc_count} found")
+                        found_any_container = True
                         break
-                else:
+                if not found_any_container:
                     self.log(
                         "warning",
-                        "⚠️  No post container elements found. "
-                        "The page may not have loaded correctly or the hashtag has no posts. "
+                        "⚠️  No post container elements found on the page. "
+                        "Possible causes: (1) not logged in to LinkedIn, "
+                        "(2) the hashtag has no posts, "
+                        "(3) LinkedIn UI selectors changed, "
+                        "(4) the wrong results page loaded (check URL below). "
                         f"URL: {page.url!r} | Title: {page.title()!r}",
                     )
 

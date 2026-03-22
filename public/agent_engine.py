@@ -287,6 +287,102 @@ class AgentEngine:
     # LinkedIn: comment on hashtag posts
     # ------------------------------------------------------------------
 
+    # LinkedIn comment-button selectors in priority order.
+    # LinkedIn frequently changes class names; we keep a broad list so at
+    # least one variant matches across UI versions.
+    _COMMENT_BTN_SELECTORS = [
+        "button[aria-label*='Comment' i]",
+        "button[data-control-name='comment']",
+        "button.comment-button",
+        ".social-action-bar__action-btn--comment",
+        ".feed-shared-social-action-bar__action-button[aria-label*='comment' i]",
+        "li.social-action-button--comment button",
+        ".social-actions button:has-text('Comment')",
+        "button:has-text('Comment')",
+    ]
+
+    # Comment editor selectors tried in order after the comment box opens.
+    _REPLY_BOX_SELECTORS = [
+        ".comments-comment-box .ql-editor",
+        ".comments-comment-texteditor .ql-editor",
+        ".comments-comment-box [contenteditable='true']",
+        "[contenteditable='true'][data-placeholder*='Add a comment' i]",
+        "[contenteditable='true'][data-placeholder*='comment' i]",
+        ".ql-editor",
+    ]
+
+    # Submit-button selectors tried in order.
+    _SUBMIT_BTN_SELECTORS = [
+        "button.comments-comment-box__submit-button",
+        "button[aria-label='Post comment']",
+        "button[aria-label*='Post comment' i]",
+        ".comments-comment-box button[type='submit']",
+        "form.comments-comment-box button:has-text('Post')",
+        "button:has-text('Post comment')",
+    ]
+
+    def _find_comment_buttons(self, page: "Page") -> "Locator":
+        """Return a Playwright Locator that matches comment buttons.
+
+        Tries a series of known LinkedIn selectors and returns the first
+        locator that yields at least one match, falling back to a broad
+        combined CSS selector if none of the individual ones match.
+        """
+        for sel in self._COMMENT_BTN_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                # .count() is cheap here and lets us skip empty locators
+                # quickly rather than handing back a locator with 0 matches.
+                if loc.count() > 0:
+                    self.log("info", f"✅ Comment buttons found with selector: {sel!r} ({loc.count()} found)")
+                    return loc
+            except Exception:
+                continue
+
+        # Fallback: combined selector string
+        combined = ", ".join(self._COMMENT_BTN_SELECTORS)
+        self.log("warning", "⚠️  No individual selector matched; falling back to combined selector.")
+        return page.locator(combined)
+
+    def _navigate_to_hashtag_feed(self, page: "Page", hashtag: str) -> bool:
+        """Navigate to the LinkedIn hashtag feed, trying two URLs.
+
+        Returns True if the feed loaded successfully (user is logged in and
+        posts are likely available), False if the user needs to log in.
+        """
+        tag = hashtag.lower().lstrip("#")
+
+        # Primary: dedicated hashtag feed
+        primary_url = f"https://www.linkedin.com/feed/hashtag/{tag}/"
+        self.log("info", f"📍 Navigating to hashtag feed: {primary_url}")
+        page.goto(primary_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(3000)
+
+        if "login" in page.url or "signup" in page.url:
+            self.log("warning", "⚠️  Not logged in (redirected to login). Please log in and re-run.")
+            page.wait_for_timeout(60000)
+            return False
+
+        # If the hashtag feed loaded but appears empty, fall back to search URL
+        # which is more reliable across LinkedIn UI versions.
+        initial_count = page.locator(", ".join(self._COMMENT_BTN_SELECTORS)).count()
+        if initial_count == 0:
+            self.log("info", "ℹ️  No comment buttons on hashtag feed; trying search URL…")
+            search_url = (
+                f"https://www.linkedin.com/search/results/content/"
+                f"?keywords=%23{tag}&origin=SWITCH_SEARCH_VERTICAL"
+            )
+            self.log("info", f"📍 Navigating to search feed: {search_url}")
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+
+            if "login" in page.url or "signup" in page.url:
+                self.log("warning", "⚠️  Not logged in (redirected to login). Please log in and re-run.")
+                page.wait_for_timeout(60000)
+                return False
+
+        return True
+
     def comment_on_hashtag_posts(
         self,
         hashtag: str = "openclaw",
@@ -302,41 +398,60 @@ class AgentEngine:
             )
 
         if self.sandbox:
-            self.log("info", f"[SANDBOX] Would search #​{hashtag} and comment on up to {max_posts} posts.")
+            self.log("info", f"[SANDBOX] Would search #{hashtag} and comment on up to {max_posts} posts.")
             self.log("info", f"[SANDBOX] Comment text: {comment_text[:100]}...")
             return max_posts
 
         if not PLAYWRIGHT_AVAILABLE:
-            self.log("error", "❌ Playwright not installed.")
+            self.log("error", "❌ Playwright not installed. Run: pip install playwright && playwright install chromium")
             return 0
 
         commented = 0
+        # count is initialised here so the final summary log always has a defined
+        # value even when an early-exit path (login wall, no buttons) is taken.
+        count = 0
         try:
             self.log("info", f"🌐 Launching browser to search #{hashtag}...")
             with sync_playwright() as pw:
                 ctx = self._launch_context(pw)
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-                hashtag_url = f"https://www.linkedin.com/feed/hashtag/{hashtag.lower().lstrip('#')}/"
-                self.log("info", f"📍 Navigating to {hashtag_url}...")
-                page.goto(hashtag_url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(3000)
-
-                if "login" in page.url or "signup" in page.url:
-                    self.log("warning", "⚠️  Not logged in. Please log in and re-run.")
-                    page.wait_for_timeout(60000)
+                if not self._navigate_to_hashtag_feed(page, hashtag):
                     ctx.close()
                     return 0
 
-                # Gather comment buttons from the feed
-                self.log("info", "🔍 Looking for posts in the feed...")
-                comment_buttons = page.locator(
-                    "button[aria-label*='comment' i], "
-                    "button.comment-button, "
-                    ".social-actions button:has-text('Comment')"
-                )
+                # Scroll to trigger lazy-loaded posts
+                self.log("info", "📜 Scrolling feed to load posts…")
+                for _ in range(3):
+                    page.evaluate("window.scrollBy(0, 800)")
+                    page.wait_for_timeout(1500)
+
+                # Wait for at least one comment button to appear
+                self.log("info", "🔍 Waiting for comment buttons to appear…")
+                try:
+                    combined_sel = ", ".join(self._COMMENT_BTN_SELECTORS)
+                    page.wait_for_selector(combined_sel, timeout=10000)
+                except Exception:
+                    self.log("warning", (
+                        "⚠️  No comment buttons found after scrolling. "
+                        f"Current URL: {page.url!r}  |  Page title: {page.title()!r}. "
+                        "Possible causes: not logged in, LinkedIn UI changed, "
+                        "or no posts with this hashtag are currently visible."
+                    ))
+                    ctx.close()
+                    return 0
+
+                comment_buttons = self._find_comment_buttons(page)
                 count = comment_buttons.count()
-                self.log("info", f"Found {count} potential comment buttons")
+                self.log("info", f"Found {count} comment button(s) on the page")
+
+                if count == 0:
+                    self.log("warning", (
+                        "⚠️  0 comment buttons found. "
+                        f"URL: {page.url!r} | Title: {page.title()!r}"
+                    ))
+                    ctx.close()
+                    return 0
 
                 for i in range(min(count, max_posts)):
                     try:
@@ -345,22 +460,43 @@ class AgentEngine:
                         btn.click(timeout=8000)
                         page.wait_for_timeout(1500)
 
-                        # Type comment in the reply box
-                        reply_box = page.locator(
-                            ".ql-editor, [contenteditable='true'][data-placeholder*='comment' i]"
-                        ).last
+                        # Wait for the comment editor to appear, then type
+                        reply_box = None
+                        for sel in self._REPLY_BOX_SELECTORS:
+                            try:
+                                loc = page.locator(sel).last
+                                if loc.count() > 0:
+                                    loc.wait_for(state="visible", timeout=5000)
+                                    reply_box = loc
+                                    break
+                            except Exception:
+                                continue
+
+                        if reply_box is None:
+                            self.log("warning", f"⚠️  Could not find comment editor for post {i + 1}; skipping.")
+                            continue
+
                         reply_box.click()
                         reply_box.type(comment_text, delay=15)
                         page.wait_for_timeout(800)
 
-                        # Submit comment
-                        submit = page.locator(
-                            "button.comments-comment-box__submit-button, "
-                            "button:has-text('Post comment')"
-                        ).last
-                        submit.click(timeout=8000)
-                        page.wait_for_timeout(2000)
+                        # Find and click the submit button
+                        submitted = False
+                        for sel in self._SUBMIT_BTN_SELECTORS:
+                            try:
+                                sub_btn = page.locator(sel).last
+                                if sub_btn.count() > 0:
+                                    sub_btn.click(timeout=8000)
+                                    submitted = True
+                                    break
+                            except Exception:
+                                continue
 
+                        if not submitted:
+                            self.log("warning", f"⚠️  Could not find submit button for post {i + 1}; skipping.")
+                            continue
+
+                        page.wait_for_timeout(2000)
                         commented += 1
                         self.log("success", f"✅ Commented on post {i + 1}")
                     except Exception as exc:
@@ -370,6 +506,7 @@ class AgentEngine:
         except Exception as exc:
             self.log("error", f"❌ Hashtag agent failed: {exc}")
 
+        self.log("info", f"📊 Total comments posted: {commented} / {min(count, max_posts)}")
         return commented
 
     # ------------------------------------------------------------------

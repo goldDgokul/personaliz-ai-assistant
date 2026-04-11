@@ -910,6 +910,11 @@ fn db_get_logs(agent_id: Option<String>, limit: Option<usize>) -> Result<Vec<db:
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn db_clear_logs(agent_id: Option<String>) -> Result<(), String> {
+    db::clear_logs(agent_id.as_deref()).map_err(|e| e.to_string())
+}
+
 // ============================================================
 // DB – Run history
 // ============================================================
@@ -1099,6 +1104,7 @@ fn main() {
             // DB – logs
             db_append_log,
             db_get_logs,
+            db_clear_logs,
             // DB – run history
             db_get_run_history,
             // DB – approvals

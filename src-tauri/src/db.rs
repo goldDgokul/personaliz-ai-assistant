@@ -423,6 +423,16 @@ pub fn get_logs(agent_id: Option<&str>, limit: usize) -> SqlResult<Vec<LogRow>> 
     }
 }
 
+pub fn clear_logs(agent_id: Option<&str>) -> SqlResult<()> {
+    let db = DB.lock().unwrap();
+    if let Some(id) = agent_id {
+        db.execute("DELETE FROM logs WHERE agent_id = ?1", params![id])?;
+    } else {
+        db.execute("DELETE FROM logs", [])?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Run history
 // ---------------------------------------------------------------------------

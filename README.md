@@ -229,12 +229,24 @@ Cron expressions are stored in the `cron_expression` column of the `schedules` t
 Click **⚡ Add Demo Agents** in the Agents or Chat tab:
 
 ### Agent 1 – LinkedIn Trending Poster (Daily)
-1. Searches for trending OpenClaw topics
-2. Generates a LinkedIn post via local LLM
-3. **Production mode**: shows Approval Modal for human review/edit before posting
-4. Posts to LinkedIn via Playwright browser automation
-5. Scheduled to run **daily** (`daily` frequency, `0 9 * * *` as cron)
-6. Generates `openclaw.config.json` automatically
+1. Fetches today's latest AI/automation topics from multiple RSS feeds
+2. Picks a fresh topic (skips the one used in the previous run to avoid repeats)
+3. **Generates a unique "viral" LinkedIn post** using a local Ollama LLM (`llama3:8b`) — no API key required
+4. Validates the post structure (hook with 🤯, transition with ↓, `->` bullets, ends with `Thoughts? 👇`) and retries once if it fails
+5. **Production mode**: shows Approval Modal for human review/edit before posting
+6. Posts to LinkedIn via Playwright browser automation
+7. Scheduled to run **daily** (`daily` frequency, `0 9 * * *` as cron)
+
+#### Required local setup for LLM generation
+```bash
+# 1. Install and start Ollama (https://ollama.com)
+ollama serve
+
+# 2. Pull the default model (one-time download, ~5 GB)
+ollama pull llama3:8b
+```
+
+The agent defaults to `llama3:8b`. Override via the `OLLAMA_MODEL` environment variable (e.g. `OLLAMA_MODEL=llama3.1:8b`).
 
 ### Agent 2 – #openclaw Hashtag Commenter (Hourly)
 1. Navigates to LinkedIn `#openclaw` hashtag feed
@@ -244,6 +256,23 @@ Click **⚡ Add Demo Agents** in the Agents or Chat tab:
 5. Generates `openclaw.config.json` automatically
 
 Both agents are fully functional in sandbox mode out of the box — no LinkedIn credentials needed to demo.
+
+---
+
+## 🗑️ Clear Logs / Clear Data
+
+### Clear Logs button (Logs tab)
+A **🗑️ Clear Logs** button appears at the top of the **Logs** tab.  
+Clicking it:
+- Deletes all rows from the SQLite `logs` table
+- Removes the `openclaw_logs` key from `localStorage`
+- Clears the in-memory logs list in the UI
+
+After a restart, old logs will **not** re-appear.
+
+### Reset App button (Settings tab)
+The existing **🔄 Reset App** button in Settings has been updated to also:
+- Delete all SQLite `logs` rows (in addition to clearing `localStorage` and resetting UI state)
 
 ---
 

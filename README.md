@@ -504,6 +504,50 @@ npm run tauri build
 
 ---
 
+## 🐛 Debugging LinkedIn Posting
+
+### Fast content filling
+
+The LinkedIn posting automation uses Playwright's `fill()` method to paste content
+into the post composer instantly, rather than simulating keystrokes one character at a
+time. This avoids the slow letter-by-letter typing issue. The engine falls back to
+`evaluate` (setting `innerText` directly) and then to `type()` with a minimal delay
+only if `fill()` fails.
+
+### Keeping the browser open after a failure
+
+By default the browser closes automatically after posting (or on error). To keep it
+open for inspection — for example when debugging a selector change or a login issue —
+set the `KEEP_BROWSER_OPEN` environment variable before running:
+
+```bash
+# Linux / macOS
+KEEP_BROWSER_OPEN=1 python3 public/agent_engine.py linkedin_post \
+  --content "Test post" --sandbox false
+
+# Windows (Command Prompt)
+set KEEP_BROWSER_OPEN=1
+python3 public/agent_engine.py linkedin_post --content "Test post" --sandbox false
+
+# Windows (PowerShell)
+$env:KEEP_BROWSER_OPEN = "1"
+python3 public/agent_engine.py linkedin_post --content "Test post" --sandbox false
+```
+
+When `KEEP_BROWSER_OPEN=1` is set:
+- On **success**: the browser stays open after posting (the script exits normally).
+- On **failure**: the browser stays open and the terminal waits for you to press **Enter** before closing, giving you time to inspect the page.
+
+### Common posting issues
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| "Could not find 'Start a post' button" | LinkedIn UI changed / not fully loaded | Wait a few seconds and retry; run with `KEEP_BROWSER_OPEN=1` to inspect |
+| Browser closes before post is sent | Timeout too short | Update to latest code (timeouts increased to 60 s navigation + 30 s post click) |
+| Post contains "Here is the output" | LLM added meta-commentary | Already handled by `_cleanup_post`; retry logic re-runs with a stricter prompt |
+
+---
+
 ## 📜 License
 
 MIT © 2024 Personaliz

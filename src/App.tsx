@@ -803,13 +803,12 @@ Keep responses concise (2-3 sentences max).`;
         return;
       }
 
-      // Trending / custom agent – try OpenClaw first, then fall back to Python
-      addLog(agentId, 'info', '🔍 Searching trending topics…');
-      await delay(800);
-      addLog(agentId, 'info', '✍️ Generating LinkedIn post…');
-      await delay(800);
+      // Trending / custom agent – generate via local Ollama (agent_engine.py)
+      addLog(agentId, 'info', '🔍 Searching trending topics via RSS feeds…');
+      addLog(agentId, 'info', '🤖 Generating viral LinkedIn post via local Ollama (llama3:8b)…');
 
-      const generatedContent = buildTrendingPost();
+      const OLLAMA_SETUP_HINT = 'ℹ️  Ensure Ollama is running: ollama serve && ollama pull llama3:8b';
+      type LogLevel = 'info' | 'success' | 'warning' | 'error';
 
       // Try to run via OpenClaw config if a config file was previously generated
       let openClawResult: any = null;
@@ -833,7 +832,40 @@ Keep responses concise (2-3 sentences max).`;
         // OpenClaw not installed or failed – continue with Python fallback
       }
 
-      if (!sandboxMode) {
+      // Run Python agent: fetches RSS topics + generates post via Ollama
+      addLog(agentId, 'info', '🐍 Calling Python agent (Ollama generation)…');
+      let pyResult: any = null;
+      try {
+        pyResult = await invoke<any>('run_python_agent', {
+          agentId,
+          agentName: agent.name,
+          sandbox: sandboxMode,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        addLog(agentId, 'error', `❌ Python agent invocation failed: ${msg}`);
+        addLog(agentId, 'info', OLLAMA_SETUP_HINT);
+        setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'idle' } : a));
+        return;
+      }
+
+      // Forward Python-side log entries to the UI activity log
+      const pyLogs: Array<{ level: LogLevel; message: string }> = pyResult?.logs ?? [];
+      for (const entry of pyLogs) {
+        addLog(agentId, entry.level || 'info', entry.message);
+      }
+
+      if (pyResult?.status === 'error') {
+        addLog(agentId, 'error', `❌ ${pyResult.message ?? 'Ollama generation failed'}`);
+        addLog(agentId, 'info', OLLAMA_SETUP_HINT);
+        setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'idle' } : a));
+        return;
+      }
+
+      const generatedContent: string = pyResult?.content ?? '';
+
+      if (pyResult?.status === 'pending_approval') {
+        // Production mode: Ollama generated content, needs human approval before posting
         addLog(agentId, 'info', '👀 Awaiting user approval…');
         setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'awaiting-approval' } : a));
         setPendingContent(generatedContent);
@@ -842,15 +874,14 @@ Keep responses concise (2-3 sentences max).`;
         return;
       }
 
-      // Sandbox: simulate
-      addLog(agentId, 'info', `[SANDBOX] Preview:\n${generatedContent.slice(0, 120)}…`);
-      addLog(agentId, 'success', '✅ Sandbox execution complete (nothing posted)');
+      // Sandbox: Ollama generated + posting simulated
+      addLog(agentId, 'success', '✅ Ollama post generated successfully!');
       setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'completed' } : a));
       await invoke('db_update_agent_status', { id: agentId, status: 'completed' }).catch(() => {});
 
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `✅ **${agent.name}** finished in sandbox mode!\n\nGenerated:\n"${generatedContent.slice(0, 150)}…"\n\n${openClawResult ? '🔧 OpenClaw config was executed.\n\n' : ''}Disable Sandbox mode in Settings to post for real.`,
+        content: `✅ **${agent.name}** finished in sandbox mode!\n\n🤖 Ollama generated:\n"${generatedContent.slice(0, 200)}…"\n\n${openClawResult ? '🔧 OpenClaw config was executed.\n\n' : ''}Disable Sandbox mode in Settings to post for real.`,
       }]);
 
     } catch (err) {
@@ -1008,21 +1039,6 @@ Keep responses concise (2-3 sentences max).`;
   // -------------------------------------------------------------------------
 
   const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-  const buildTrendingPost = () =>
-    `🚀 Just discovered something amazing: How OpenClaw is revolutionising RPA automation
-
-OpenClaw makes automation accessible to everyone – no coding required! 💡
-
-With the new Personaliz Desktop Assistant you can:
-✅ Create agents by chatting
-✅ Automate LinkedIn posts & comments
-✅ Test in sandbox mode before going live
-✅ Get human approval before every post
-
-Perfect for non-technical users who want to automate their workflows!
-
-#OpenClaw #Automation #NoCode #RPA #AI`;
 
   /** Format an ISO 8601 timestamp to 'YYYY-MM-DD HH:MM:SS' for display. */
   const fmtTs = (ts: string) => ts.slice(0, 19).replace('T', ' ');

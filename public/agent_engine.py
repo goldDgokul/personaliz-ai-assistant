@@ -283,14 +283,15 @@ def _reformat_post(text: str) -> str:
             continue
         # If the line is too long, attempt to split at a sentence boundary or word boundary.
         while len(stripped) > _MAX_LINE_LENGTH:
-            # Try to find the last sentence-ending punctuation within the limit
+            # Try to find the last sentence-ending punctuation followed by a space
+            # within the allowed limit.
             cut = stripped[:_MAX_LINE_LENGTH]
-            # Find last good break point: sentence end or space
             break_pos = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
-            if break_pos > 0:
+            if break_pos >= 0:
+                # Include the punctuation character; skip the trailing space (break_pos+1).
                 result_lines.append(stripped[:break_pos + 1].strip())
                 result_lines.append("")  # blank line
-                stripped = stripped[break_pos + 1:].strip()
+                stripped = stripped[break_pos + 2:].strip()
             else:
                 # Fall back to last space within limit
                 space_pos = cut.rfind(" ")
@@ -310,8 +311,9 @@ def _reformat_post(text: str) -> str:
 
     # Re-apply CTA normalisation
     if not joined.endswith(_REQUIRED_CTA):
-        if "Thoughts?" in joined.split("\n")[-1]:
-            joined = joined.rsplit("Thoughts?", 1)[0] + _REQUIRED_CTA
+        last_line = joined.split("\n")[-1] if joined else ""
+        if joined and "Thoughts?" in last_line:
+            joined = joined.rsplit("\n", 1)[0].rstrip() + "\n\n" + _REQUIRED_CTA
         else:
             joined = joined.rstrip() + "\n\n" + _REQUIRED_CTA
 
@@ -594,7 +596,7 @@ class AgentEngine:
         if not transition_found:
             violations.append(
                 "Missing standalone transition line near the top "
-                "(e.g. 'Here is the thing ↓' or 'Here\\'s what happened ↓')"
+                "(e.g. 'Here is the thing \u2193' or \"Here's what happened \u2193\")"
             )
 
         # --- Must contain the ↓ character somewhere (basic check) ---
@@ -611,14 +613,14 @@ class AgentEngine:
             word_count = len(bl.strip().split())
             if word_count > _MAX_BULLET_WORDS:
                 violations.append(
-                    f"Bullet too long ({word_count} words): '{bl.strip()[:60]}…' — max {_MAX_BULLET_WORDS} words"
+                    f"Bullet too long ({word_count} words): '{bl.strip()[:60]}...' — max {_MAX_BULLET_WORDS} words"
                 )
 
-        # --- No line longer than _MAX_LINE_LENGTH ---
+        # --- No line longer than _MAX_LINE_LENGTH (measure stripped length) ---
         for ln in lines:
-            if len(ln) > _MAX_LINE_LENGTH:
+            if len(ln.strip()) > _MAX_LINE_LENGTH:
                 violations.append(
-                    f"Line exceeds {_MAX_LINE_LENGTH} chars ({len(ln)} chars): '{ln[:60]}…'"
+                    f"Line exceeds {_MAX_LINE_LENGTH} chars ({len(ln.strip())} chars): '{ln.strip()[:60]}...'"
                 )
 
         # --- Structural headings / meta markers ---

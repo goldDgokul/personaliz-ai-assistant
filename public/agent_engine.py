@@ -14,6 +14,7 @@ Legacy positional interface (kept for backward compat):
 
 import sys
 import json
+import random
 import time
 import argparse
 import os
@@ -142,14 +143,14 @@ _AI_KEYWORDS = {
 _AI_FALLBACK_TOPICS = [
     "How AI agents are replacing entire workflows in 2025",
     "Why LLMs are becoming the new operating system for knowledge workers",
-    "Local AI models are beating cloud APIs — here is why it matters",
+    "Local AI models are beating cloud APIs — here's why it matters",
     "Why RAG is becoming the standard architecture for enterprise AI",
     "Anthropic Claude vs OpenAI GPT — what the benchmark war misses",
     "AI agents that browse the web are about to change how we work",
     "The hidden cost of AI inference: why cheap models are eating the market",
     "Why multimodal AI is the next big platform shift",
     "How Cursor is using AI to transform the developer experience",
-    "DeepMind latest breakthrough and what it means for AGI timelines",
+    "DeepMind's latest breakthrough and what it means for AGI timelines",
     "The rise of AI orchestration: why agent frameworks matter",
     "Why every company is becoming an AI company in 2025",
     "The model collapse problem: what happens when AI trains on AI data",
@@ -1206,7 +1207,6 @@ class AgentEngine:
             if chosen_topic is None:
                 # All fetched topics have been used recently — pick a random one
                 # and log a warning so the operator knows the pool is exhausted.
-                import random
                 chosen_topic = random.choice(topics)
                 self.log(
                     "warning",

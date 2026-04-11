@@ -81,7 +81,16 @@ You are dropping inside knowledge that the general public is missing. There is n
 Output ONLY the final LinkedIn post text.
 Do NOT include section headers, labels, or meta-commentary of any kind.
 Do NOT prefix sections with labels such as "The Hook:", "The Transition:", "The Setup:", "The Core Insight:", "The Twist:", "The Takeaway:", "The CTA:", or any variation of these (with or without asterisks/markdown).
-The very first word of your response must be the first word of the post itself."""
+The very first word of your response must be the first word of the post itself.
+
+**STRICT OUTPUT RULES (non-negotiable — your response is auto-rejected if any rule is violated):**
+1. HOOK: The first 1–2 lines must be short and punchy, and the hook MUST end with 🤯 (the emoji must be the very last character of the hook section).
+2. TRANSITION: Immediately after the hook there must be a standalone line containing exactly "Here is the thing ↓" or "Here's what happened ↓" — no other text on that line.
+3. WHITESPACE: Use exactly one blank line (i.e. a double newline, "\\n\\n") between EVERY line or sentence throughout the entire post. Never write two sentences on the same line without a blank line in between.
+4. BULLETS: Include at least 3 bullet points using ONLY the "->" symbol. Each bullet must be a single line, 15 words or fewer.
+5. LINE LENGTH: No single line may exceed 140 characters. Maximum 1 sentence per line.
+6. CTA: The very last line of the post must be exactly: Thoughts? 👇
+7. OUTPUT: Output ONLY the final post. Do NOT write anything before the hook or after the CTA."""
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +102,17 @@ _REQUIRED_HOOK_EMOJI = "🤯"
 _REQUIRED_TRANSITION = "↓"
 _REQUIRED_BULLET = "->"
 _MIN_RSS_TITLE_LENGTH = 15
+
+# Maximum character length for a single post line (broetry rule).
+_MAX_LINE_LENGTH = 140
+# Maximum number of words allowed in a single `->` bullet.
+_MAX_BULLET_WORDS = 15
+# Minimum number of `->` bullets required.
+_MIN_BULLET_COUNT = 3
+# Hook must be within this many non-blank lines of the start of the post.
+_HOOK_EMOJI_MAX_LINE = 2
+# Transition phrase(s) that must appear as a standalone line near the top.
+_TRANSITION_PHRASES = ("here is the thing ↓", "here's what happened ↓")
 
 # Regex that matches lines containing structural section headings produced by
 # LLMs when they "show their work".  Matches both markdown-bold variants
@@ -238,6 +258,66 @@ def _cleanup_post(text: str) -> Tuple[str, bool]:
 
     return cleaned, removed
 
+
+def _reformat_post(text: str) -> str:
+    """Lightweight post-processor that enforces broetry whitespace without changing wording.
+
+    Applied as a last-resort fallback after both initial generation and one retry
+    have failed strict validation.  The function:
+
+    1. Splits the text into individual sentences / bullet lines.
+    2. Joins them with double newlines (\\n\\n) so the broetry spacing is correct.
+    3. Truncates any line that exceeds _MAX_LINE_LENGTH at the last word boundary
+       and carries the remainder forward as a new line.
+    4. Re-applies the CTA normalisation.
+
+    This is intentionally conservative — it never removes words or reorders
+    sentences, only adds/adjusts whitespace.
+    """
+    # First pass: ensure each non-blank line is separated by exactly one blank line.
+    lines = text.splitlines()
+    result_lines: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # If the line is too long, attempt to split at a sentence boundary or word boundary.
+        while len(stripped) > _MAX_LINE_LENGTH:
+            # Try to find the last sentence-ending punctuation followed by a space
+            # within the allowed limit.
+            cut = stripped[:_MAX_LINE_LENGTH]
+            break_pos = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+            if break_pos >= 0:
+                # Include the punctuation character; skip the trailing space (break_pos+1).
+                result_lines.append(stripped[:break_pos + 1].strip())
+                result_lines.append("")  # blank line
+                stripped = stripped[break_pos + 2:].strip()
+            else:
+                # Fall back to last space within limit
+                space_pos = cut.rfind(" ")
+                if space_pos > 0:
+                    result_lines.append(stripped[:space_pos].strip())
+                    result_lines.append("")
+                    stripped = stripped[space_pos + 1:].strip()
+                else:
+                    break  # Can't split further, leave as-is
+        if stripped:
+            result_lines.append(stripped)
+            result_lines.append("")  # blank line after each content line
+
+    # Join and collapse any accidental double-blank-lines
+    joined = "\n".join(result_lines).strip()
+    joined = re.sub(r"\n{3,}", "\n\n", joined)
+
+    # Re-apply CTA normalisation
+    if not joined.endswith(_REQUIRED_CTA):
+        last_line = joined.split("\n")[-1] if joined else ""
+        if joined and "Thoughts?" in last_line:
+            joined = joined.rsplit("\n", 1)[0].rstrip() + "\n\n" + _REQUIRED_CTA
+        else:
+            joined = joined.rstrip() + "\n\n" + _REQUIRED_CTA
+
+    return joined
 
 
 def _is_ai_topic(title: str) -> bool:
@@ -476,25 +556,84 @@ class AgentEngine:
         contains structural section-heading labels (e.g. "The Hook:"), or if it
         contains meta-commentary prefixes (e.g. "Here is the output", "Output:").
         """
+        violations = self._collect_violations(text)
+        return len(violations) == 0
+
+    def _collect_violations(self, text: str) -> List[str]:
+        """Return a list of human-readable violation strings for *text*.
+
+        An empty list means the post is fully valid.  Each string describes one
+        failed rule so it can be fed back into the retry prompt.
+        """
+        violations: List[str] = []
+        lines = text.splitlines()
+        non_blank = [ln for ln in lines if ln.strip()]
+
+        # --- CTA ---
         if not text.endswith(_REQUIRED_CTA):
-            return False
-        if _REQUIRED_HOOK_EMOJI not in text:
-            return False
+            violations.append(f"Last line must be exactly '{_REQUIRED_CTA}'")
+
+        # --- Hook emoji in first 1-2 non-blank lines ---
+        hook_lines = non_blank[:_HOOK_EMOJI_MAX_LINE]
+        if not any(_REQUIRED_HOOK_EMOJI in ln for ln in hook_lines):
+            violations.append(
+                f"Hook (first {_HOOK_EMOJI_MAX_LINE} lines) must end with {_REQUIRED_HOOK_EMOJI}"
+            )
+
+        # --- Hook lines must be short (≤ _MAX_LINE_LENGTH chars) ---
+        for i, ln in enumerate(hook_lines):
+            if len(ln.strip()) > _MAX_LINE_LENGTH:
+                violations.append(
+                    f"Hook line {i+1} is too long ({len(ln.strip())} chars); max {_MAX_LINE_LENGTH}"
+                )
+
+        # --- Transition line near the top (within first 6 non-blank lines) ---
+        transition_found = False
+        for ln in non_blank[:6]:
+            if ln.strip().lower() in _TRANSITION_PHRASES:
+                transition_found = True
+                break
+        if not transition_found:
+            violations.append(
+                "Missing standalone transition line near the top "
+                "(e.g. 'Here is the thing \u2193' or \"Here's what happened \u2193\")"
+            )
+
+        # --- Must contain the ↓ character somewhere (basic check) ---
         if _REQUIRED_TRANSITION not in text:
-            return False
-        if _REQUIRED_BULLET not in text:
-            return False
-        # Fail if the LLM included structural headings or meta markers that
-        # should not appear in the final post shown to the user.
-        for line in text.splitlines():
+            violations.append(f"Post must contain '{_REQUIRED_TRANSITION}'")
+
+        # --- Bullet count and length ---
+        bullet_lines = [ln for ln in lines if ln.strip().startswith("->")]
+        if len(bullet_lines) < _MIN_BULLET_COUNT:
+            violations.append(
+                f"Need at least {_MIN_BULLET_COUNT} '->' bullets; found {len(bullet_lines)}"
+            )
+        for bl in bullet_lines:
+            word_count = len(bl.strip().split())
+            if word_count > _MAX_BULLET_WORDS:
+                violations.append(
+                    f"Bullet too long ({word_count} words): '{bl.strip()[:60]}...' — max {_MAX_BULLET_WORDS} words"
+                )
+
+        # --- No line longer than _MAX_LINE_LENGTH (measure stripped length) ---
+        for ln in lines:
+            if len(ln.strip()) > _MAX_LINE_LENGTH:
+                violations.append(
+                    f"Line exceeds {_MAX_LINE_LENGTH} chars ({len(ln.strip())} chars): '{ln.strip()[:60]}...'"
+                )
+
+        # --- Structural headings / meta markers ---
+        for line in lines:
             stripped = line.strip()
             if _HEADING_PATTERN.match(stripped):
-                return False
+                violations.append(f"Structural heading found: '{stripped[:60]}'")
             if _META_LINE_PATTERN.match(stripped):
-                return False
+                violations.append(f"Meta commentary found: '{stripped[:60]}'")
             if _META_INLINE_RE.match(stripped):
-                return False
-        return True
+                violations.append(f"Inline meta prefix found: '{stripped[:60]}'")
+
+        return violations
 
     def generate_viral_linkedin_post(self, topic: str) -> Optional[str]:
         """Generate a viral LinkedIn post for the given topic using local Ollama.
@@ -503,10 +642,12 @@ class AgentEngine:
         Steps:
         1. Generate with the viral prompt.
         2. Apply cleanup (strip heading lines, meta markers, ensure CTA) and log if it ran.
-        3. If the cleaned post still fails validation (missing required elements,
-           headings survived cleanup, or meta markers remain), retry once with a
-           stronger instruction tailored to the detected failure type.
-        4. Apply cleanup again on the retry output and log the result.
+        3. If the cleaned post still fails validation, collect the specific violations
+           and retry once with a corrective suffix that lists every violation.
+        4. Apply cleanup again on the retry output.
+        5. If retry also fails validation, apply _reformat_post as a last-resort
+           lightweight formatter (adds whitespace / enforces broetry spacing) and
+           return the reformatted post with a warning.
         """
         self.log("info", f"🤖 Generating viral LinkedIn post for topic: {topic[:80]}...")
         model = os.environ.get("OLLAMA_MODEL", "llama3:8b")
@@ -523,9 +664,11 @@ class AgentEngine:
                 self.log("success", "✅ Post generated and validated successfully.")
                 return post
 
-            # Check the raw output (before cleanup) to determine the failure cause.
-            # cleanup may have already removed the markers from `post`, so
-            # `raw_post` is the authoritative source for root-cause detection.
+            # Collect violations from the cleaned post (or raw post if cleanup yielded nothing)
+            check_text = post if post else (raw_post or "")
+            violations = self._collect_violations(check_text) if check_text else []
+
+            # Also check for raw heading/meta markers before cleanup stripped them
             heading_detected = bool(raw_post) and any(
                 _HEADING_PATTERN.match(ln.strip()) for ln in raw_post.splitlines()
             )
@@ -533,55 +676,63 @@ class AgentEngine:
                 _META_LINE_PATTERN.match(ln.strip()) or _META_INLINE_RE.match(ln.strip())
                 for ln in raw_post.splitlines()
             )
-            failure_reason = (
-                " (heading labels detected)" if heading_detected else
-                " (meta commentary detected)" if meta_detected else
-                ""
-            )
+
+            violation_summary = "; ".join(violations[:5]) if violations else "unknown formatting issues"
             self.log(
                 "warning",
-                "⚠️  Post failed validation" + failure_reason + " – retrying with stricter instruction...",
+                f"⚠️  Post failed validation ({len(violations)} violation(s): {violation_summary}) "
+                "– retrying with stricter instruction...",
             )
 
+            # Build a corrective retry suffix that enumerates every violation
+            violation_list = "\n".join(f"  - {v}" for v in violations) if violations else ""
+            retry_suffix_parts = [
+                "\n\nYOUR PREVIOUS RESPONSE WAS REJECTED. Violations detected:"
+            ]
+            if violation_list:
+                retry_suffix_parts.append(violation_list)
             if meta_detected:
-                retry_suffix = (
-                    "\n\nCRITICAL: your previous response was rejected because it started with "
-                    "meta-commentary such as 'Here is the output' or 'Output:'. "
+                retry_suffix_parts.append(
                     "Do NOT say 'here is the output', 'here is the post', 'output:', or any similar phrase. "
-                    "Output ONLY the post itself — the very first word of your response must be "
-                    "the first word of the LinkedIn post. "
-                    f"The post must end exactly with '{_REQUIRED_CTA}'."
+                    "The very first word of your response must be the first word of the LinkedIn post."
                 )
-            elif heading_detected:
-                retry_suffix = (
-                    "\n\nIMPORTANT CORRECTION – your previous response was rejected because it "
-                    "contained structural section labels (e.g. '**The Hook:**', 'The Transition:', etc.). "
-                    "Output ONLY the final post text. "
-                    "Do NOT include any section headers or labels whatsoever. "
-                    f"The post must end exactly with '{_REQUIRED_CTA}', "
-                    f"include '{_REQUIRED_HOOK_EMOJI}' in the hook, "
-                    f"include '{_REQUIRED_TRANSITION}' in a transition line, "
-                    f"and use '{_REQUIRED_BULLET}' for every bullet point."
+            if heading_detected:
+                retry_suffix_parts.append(
+                    "Do NOT include any section headers or labels (e.g. 'The Hook:', 'The Transition:')."
                 )
-            else:
-                retry_suffix = (
-                    f"\n\nFix formatting strictly: "
-                    f"ensure the post ends exactly with '{_REQUIRED_CTA}', "
-                    f"includes '{_REQUIRED_HOOK_EMOJI}' in the hook, "
-                    f"includes '{_REQUIRED_TRANSITION}' in a transition line, "
-                    f"and uses '{_REQUIRED_BULLET}' for bullet points. "
-                    "Output ONLY the final post text with no section headers."
-                )
+            retry_suffix_parts.append(
+                "Fix ALL violations and rewrite the post strictly following the STRICT OUTPUT RULES above. "
+                f"Hook must be 1-2 short lines ending with {_REQUIRED_HOOK_EMOJI}. "
+                f"Second section must be a standalone line: 'Here is the thing ↓' or 'Here's what happened ↓'. "
+                f"Use exactly one blank line (double newline) between every line. "
+                f"Include at least {_MIN_BULLET_COUNT} '->' bullets, each under {_MAX_BULLET_WORDS} words. "
+                f"No line may exceed {_MAX_LINE_LENGTH} characters. "
+                f"End exactly with '{_REQUIRED_CTA}'. "
+                "Output ONLY the final post."
+            )
+            retry_suffix = "\n".join(retry_suffix_parts)
 
             retry_raw = self._generate_with_ollama(prompt + retry_suffix, model=model)
             if retry_raw:
                 post, retry_cleaned = _cleanup_post(retry_raw)
                 if retry_cleaned:
                     self.log("info", "🧹 Cleanup applied on retry output: removed heading lines / meta commentary / fixed CTA.")
-                if not self._validate_post(post):
-                    self.log("warning", "⚠️  Retry also failed validation – using output anyway.")
-                else:
+                if self._validate_post(post):
                     self.log("success", "✅ Retry post validated successfully.")
+                    return post
+
+                # Last resort: apply lightweight reformatter to enforce broetry spacing
+                self.log("warning", "⚠️  Retry also failed validation – applying lightweight reformatter as fallback.")
+                post = _reformat_post(post)
+                remaining = self._collect_violations(post)
+                if remaining:
+                    self.log(
+                        "warning",
+                        f"⚠️  Reformatted post still has {len(remaining)} violation(s) – returning best effort. "
+                        f"Violations: {'; '.join(remaining[:3])}",
+                    )
+                else:
+                    self.log("success", "✅ Reformatted post passes validation.")
                 return post
 
         except Exception as exc:

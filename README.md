@@ -234,7 +234,7 @@ Click **⚡ Add Demo Agents** in the Agents or Chat tab:
 3. **Generates a unique "viral" LinkedIn post** using a local Ollama LLM (`llama3:8b`) — no API key required
 4. Validates the post structure (hook with 🤯, transition with ↓, `->` bullets, ends with `Thoughts? 👇`) and retries once if it fails
 5. **Production mode**: shows Approval Modal for human review/edit before posting
-6. Posts to LinkedIn via Playwright browser automation
+6. Posts to LinkedIn via Playwright browser automation (instant paste — not letter-by-letter typing)
 7. Scheduled to run **daily** (`daily` frequency, `0 9 * * *` as cron)
 
 #### Required local setup for LLM generation
@@ -247,6 +247,15 @@ ollama pull llama3:8b
 ```
 
 The agent defaults to `llama3:8b`. Override via the `OLLAMA_MODEL` environment variable (e.g. `OLLAMA_MODEL=llama3.1:8b`).
+
+#### Debugging browser automation
+Set `KEEP_BROWSER_OPEN=1` before running to prevent the Chromium window from closing when an error occurs. The window will stay open for 60 seconds so you can inspect the page state (login wall, captcha, selector mismatch, etc.):
+
+```bash
+KEEP_BROWSER_OPEN=1 python3 public/agent_engine.py linkedin_post --content "test" --sandbox false
+```
+
+This is also respected by the Trending Agent when it calls `post_to_linkedin_browser` internally.
 
 ### Agent 2 – #openclaw Hashtag Commenter (Hourly)
 1. Navigates to LinkedIn `#openclaw` hashtag feed

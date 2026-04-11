@@ -105,10 +105,13 @@ _HEADING_PATTERN = re.compile(
 )
 
 # Regex that matches boilerplate meta-commentary lines that LLMs sometimes emit
-# before or after the actual post content, e.g. "Here is the output:" or "Output:".
+# before or after the actual post content, e.g. "Here is the output:" or
+# "Here is the viral LinkedIn post:" or "Output:".
 # These must be stripped from the generated post before it is shown/posted.
+# The `(?:\w+\s+){0,2}` group allows up to 2 adjective words between the
+# optional "the" and the noun (e.g. "the viral LinkedIn post").
 _META_LINE_PATTERN = re.compile(
-    r"^(?:here(?:'?s| is)(?:\s+the)?\s+(?:output|post|linkedin\s*post|result|answer):?"
+    r"^(?:here(?:'?s| is)\s+(?:the\s+)?(?:\w+\s+){0,2}(?:output|post|linkedin\s*post|result|answer|response):?"
     r"|output\s*:|final\s*(?:answer\s*)?:|linkedin\s*post\s*:|post\s*:)\s*$",
     re.IGNORECASE,
 )
@@ -116,10 +119,43 @@ _META_LINE_PATTERN = re.compile(
 # Same pattern but without the end-anchor, used to strip an inline meta prefix
 # from a line that also contains post content (e.g. "Output: AI is eating...").
 _META_INLINE_RE = re.compile(
-    r"^(?:here(?:'?s| is)(?:\s+the)?\s+(?:output|post|linkedin\s*post|result|answer):?"
+    r"^(?:here(?:'?s| is)\s+(?:the\s+)?(?:\w+\s+){0,2}(?:output|post|linkedin\s*post|result|answer|response):?"
     r"|output\s*:|final\s*(?:answer\s*)?:|linkedin\s*post\s*:|post\s*:)\s+",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# AI topic filtering constants
+# ---------------------------------------------------------------------------
+
+# Lowercase keywords used to decide whether an RSS headline is AI-related.
+_AI_KEYWORDS = {
+    "ai", "llm", "llms", "agent", "agents", "openai", "anthropic", "gemini",
+    "deepmind", "model", "models", "transformer", "inference", "rag",
+    "copilot", "cursor", "multimodal", "gpt", "claude", "mistral", "llama",
+    "neural", "machine learning", "deep learning", "artificial intelligence",
+    "generative", "diffusion", "embedding", "vector", "chatbot",
+    "langchain", "hugging face", "huggingface", "automation",
+}
+
+# Curated AI-only fallback topics used when no live feed topics pass the filter.
+_AI_FALLBACK_TOPICS = [
+    "How AI agents are replacing entire workflows in 2025",
+    "Why LLMs are becoming the new operating system for knowledge workers",
+    "Local AI models are beating cloud APIs — here is why it matters",
+    "Why RAG is becoming the standard architecture for enterprise AI",
+    "Anthropic Claude vs OpenAI GPT — what the benchmark war misses",
+    "AI agents that browse the web are about to change how we work",
+    "The hidden cost of AI inference: why cheap models are eating the market",
+    "Why multimodal AI is the next big platform shift",
+    "How Cursor is using AI to transform the developer experience",
+    "DeepMind latest breakthrough and what it means for AGI timelines",
+    "The rise of AI orchestration: why agent frameworks matter",
+    "Why every company is becoming an AI company in 2025",
+    "The model collapse problem: what happens when AI trains on AI data",
+    "Why agentic AI is different from chatbots — and why it matters",
+    "Open-source LLMs are closing the gap on proprietary models fast",
+]
 
 
 def _cleanup_post(text: str) -> Tuple[str, bool]:
@@ -203,6 +239,12 @@ def _cleanup_post(text: str) -> Tuple[str, bool]:
 
 
 
+def _is_ai_topic(title: str) -> bool:
+    """Return True if *title* contains at least one AI-related keyword."""
+    lower = title.lower()
+    return any(kw in lower for kw in _AI_KEYWORDS)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -269,45 +311,73 @@ class AgentEngine:
     # ------------------------------------------------------------------
 
     def search_trending_topics(self) -> List[str]:
-        self.log("info", "🔍 Searching for trending AI/automation topics...")
+        """Return a list of trending topic strings.
+
+        When ``TRENDING_TOPIC_MODE`` is ``ai`` (the default), only AI-related
+        topics are returned.  Set the env var to ``general`` to restore the
+        original mixed-topic behaviour.
+        """
+        mode = os.environ.get("TRENDING_TOPIC_MODE", "ai").lower()
+        self.log("info", f"🔍 Searching for trending topics (mode={mode})...")
 
         # Try to fetch from real RSS feeds / curated sources
-        topics = self._fetch_topics_from_rss()
+        topics = self._fetch_topics_from_rss(ai_only=(mode == "ai"))
         if topics:
             self.log("success", f"✅ Fetched {len(topics)} live topics from feed")
             return topics
 
-        # Fallback to curated hardcoded topics
-        fallback_topics = [
-            "How AI agents are replacing entire workflows in 2025",
-            "The no-code automation revolution: what most people are missing",
-            "Why LLMs are the new operating system for knowledge workers",
-            "Local AI models: why running LLMs on your own hardware matters",
-            "Browser automation is eating the enterprise software market",
-            "The future of work: AI-assisted decision-making vs full automation",
-            "Why agentic AI is different from chatbots — and why it matters",
-        ]
-        self.log("info", f"ℹ️  Using {len(fallback_topics)} curated topics (no live feed available)")
+        # Fallback to curated AI-only topics (or generic if general mode)
+        if mode == "ai":
+            fallback_topics = list(_AI_FALLBACK_TOPICS)
+            self.log("info", f"ℹ️  Using {len(fallback_topics)} curated AI topics (no live feed available)")
+        else:
+            fallback_topics = [
+                "How AI agents are replacing entire workflows in 2025",
+                "The no-code automation revolution: what most people are missing",
+                "Why LLMs are the new operating system for knowledge workers",
+                "Local AI models: why running LLMs on your own hardware matters",
+                "Browser automation is eating the enterprise software market",
+                "The future of work: AI-assisted decision-making vs full automation",
+                "Why agentic AI is different from chatbots — and why it matters",
+            ]
+            self.log("info", f"ℹ️  Using {len(fallback_topics)} curated topics (no live feed available)")
         return fallback_topics
 
-    def _fetch_topics_from_rss(self) -> List[str]:
-        """Attempt to fetch trending automation/AI topics from public RSS feeds.
+    def _fetch_topics_from_rss(self, ai_only: bool = True) -> List[str]:
+        """Attempt to fetch trending topics from public RSS feeds.
+
+        When ``ai_only`` is ``True`` (the default), only items whose titles
+        contain at least one AI-related keyword are kept.
 
         Returns an empty list on failure so the caller can fall back gracefully.
         Only uses the stdlib (no requests dependency required).
         """
         import xml.etree.ElementTree as ET
 
-        # Public RSS feeds related to automation/AI/no-code/productivity
-        feeds = [
-            "https://hnrss.org/frontpage",           # Hacker News front page
-            "https://hnrss.org/newest?q=AI+automation",  # HN search: AI automation
-            "https://feeds.feedburner.com/venturebeat/SZYF",  # VentureBeat AI
-            "https://www.producthunt.com/feed",       # Product Hunt
-            "https://zapier.com/engineering/feeds/rss/",
-            "https://medium.com/feed/tag/artificial-intelligence",
-            "https://medium.com/feed/tag/automation",
-        ]
+        if ai_only:
+            # AI-focused feeds ordered by reliability and relevance
+            feeds = [
+                "http://rss.arxiv.org/rss/cs.AI",                         # arXiv cs.AI
+                "http://rss.arxiv.org/rss/cs.LG",                         # arXiv cs.LG (machine learning)
+                "https://hnrss.org/newest?q=AI",                          # HN newest: AI
+                "https://hnrss.org/newest?q=LLM",                         # HN newest: LLM
+                "https://hnrss.org/newest?q=machine+learning",            # HN newest: ML
+                "https://feeds.feedburner.com/venturebeat/SZYF",          # VentureBeat AI
+                "https://medium.com/feed/tag/artificial-intelligence",     # Medium: AI
+                "https://medium.com/feed/tag/llm",                        # Medium: LLM
+                "https://thegradient.pub/rss/",                           # The Gradient (AI research)
+            ]
+        else:
+            feeds = [
+                "https://hnrss.org/frontpage",
+                "https://hnrss.org/newest?q=AI+automation",
+                "https://feeds.feedburner.com/venturebeat/SZYF",
+                "https://www.producthunt.com/feed",
+                "https://zapier.com/engineering/feeds/rss/",
+                "https://medium.com/feed/tag/artificial-intelligence",
+                "https://medium.com/feed/tag/automation",
+            ]
+
         seen: set = set()
         topics: List[str] = []
         for feed_url in feeds:
@@ -324,14 +394,18 @@ class AgentEngine:
                 # RSS <item><title> or Atom <entry><title>
                 for item in root.iter("item"):
                     title = item.findtext("title", "").strip()
-                    if title and len(title) > _MIN_RSS_TITLE_LENGTH and title not in seen:
+                    if (title and len(title) > _MIN_RSS_TITLE_LENGTH
+                            and title not in seen
+                            and (not ai_only or _is_ai_topic(title))):
                         seen.add(title)
                         topics.append(title)
                 for entry in root.iter("{http://www.w3.org/2005/Atom}entry"):
                     title_el = entry.find("{http://www.w3.org/2005/Atom}title")
                     if title_el is not None and title_el.text:
                         t = title_el.text.strip()
-                        if t and len(t) > _MIN_RSS_TITLE_LENGTH and t not in seen:
+                        if (t and len(t) > _MIN_RSS_TITLE_LENGTH
+                                and t not in seen
+                                and (not ai_only or _is_ai_topic(t))):
                             seen.add(t)
                             topics.append(t)
             except Exception:
@@ -1115,14 +1189,31 @@ class AgentEngine:
         try:
             topics = self.search_trending_topics()
 
-            # Pick a topic that hasn't been used in the previous run
+            # Pick a topic not in the rolling recent-topics list to avoid
+            # repeating the same handful of headlines across runs.
             state = self._load_topic_state()
-            last_topic = state.get("last_topic", "")
-            chosen_topic = topics[0]
+            recent_topics: List[str] = state.get("recent_topics", [])
+            # Back-compat: migrate legacy single `last_topic` field
+            if not recent_topics and state.get("last_topic"):
+                recent_topics = [state["last_topic"]]
+
+            chosen_topic = None
             for t in topics:
-                if t != last_topic:
+                if t not in recent_topics:
                     chosen_topic = t
                     break
+
+            if chosen_topic is None:
+                # All fetched topics have been used recently — pick a random one
+                # and log a warning so the operator knows the pool is exhausted.
+                import random
+                chosen_topic = random.choice(topics)
+                self.log(
+                    "warning",
+                    "⚠️  All fetched topics are in recent_topics — picking randomly. "
+                    "Consider increasing RSS variety or clearing the state file.",
+                )
+
             self.log("info", f"📌 Chosen topic: {chosen_topic[:100]}")
 
             # Generate viral post via local Ollama
@@ -1136,8 +1227,10 @@ class AgentEngine:
                     "logs": self.logs,
                 }
 
-            # Persist topic so next run skips it
-            self._save_topic_state({"last_topic": chosen_topic})
+            # Persist topic in rolling recent-topics list (keep last 20)
+            recent_topics.append(chosen_topic)
+            recent_topics = recent_topics[-20:]
+            self._save_topic_state({"recent_topics": recent_topics})
 
             if self.sandbox:
                 self.log("info", f"[SANDBOX] Preview post:\n\n{post}")

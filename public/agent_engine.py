@@ -104,14 +104,33 @@ _HEADING_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Regex matching common meta-commentary prefixes that LLMs add before the actual
+# post content (e.g. "Here is the output:", "LinkedIn post:", "Final post:").
+_META_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"here(?:\'s|\s+is)\s+(?:the\s+)?(?:output|post|linkedin\s+post|result|generated\s+post|viral\s+post)"
+    r"|output\s*:"
+    r"|final\s+(?:post\s*:?|output\s*:?|linkedin\s+post\s*:?|:)"
+    r"|linkedin\s+post\s*:"
+    r"|post\s*:"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
 
 def _cleanup_post(text: str) -> Tuple[str, bool]:
-    """Strip structural section-heading labels from a generated post.
+    """Strip structural section-heading labels and meta-commentary from a generated post.
+
+    Removes:
+    1. Meta-commentary prefix lines such as "Here is the output", "Output:", "Final:", etc.
+    2. Structural section-heading labels produced by LLMs (e.g. "**The Hook:**").
+    3. Code fences (``` or ~~~) wrapping the post.
+    4. Leading/trailing quotation marks that wrap the whole post.
 
     Heading lines come in two forms:
-    1. Label + content on the same line:
+    a. Label + content on the same line:
        ``**The Hook:** AI is eating every job. 🤯``  →  ``AI is eating every job. 🤯``
-    2. Label-only line followed by content on the next line(s):
+    b. Label-only line followed by content on the next line(s):
        ``**The Core Insight (The Meat):**``  →  line removed entirely
 
     Returns ``(cleaned_text, was_cleaned)`` where ``was_cleaned`` is ``True``
@@ -126,11 +145,37 @@ def _cleanup_post(text: str) -> Tuple[str, bool]:
         re.IGNORECASE,
     )
 
-    lines = text.splitlines()
-    cleaned_lines = []
     removed = False
+
+    # --- Step 1: Strip code fences (``` or ~~~) wrapping the whole post ------
+    stripped_text = text.strip()
+    code_fence_re = re.compile(r"^```[^\n]*\n(.*?)```\s*$", re.DOTALL)
+    tilde_fence_re = re.compile(r"^~~~[^\n]*\n(.*?)~~~\s*$", re.DOTALL)
+    for fence_re in (code_fence_re, tilde_fence_re):
+        m = fence_re.match(stripped_text)
+        if m:
+            stripped_text = m.group(1).strip()
+            removed = True
+            break
+
+    # --- Step 2: Strip outer quotation marks wrapping the entire post --------
+    if stripped_text.startswith('"') and stripped_text.endswith('"'):
+        stripped_text = stripped_text[1:-1].strip()
+        removed = True
+    elif stripped_text.startswith("'") and stripped_text.endswith("'"):
+        stripped_text = stripped_text[1:-1].strip()
+        removed = True
+
+    # --- Step 3: Strip per-line meta/heading labels --------------------------
+    lines = stripped_text.splitlines()
+    cleaned_lines: List[str] = []
     for line in lines:
         stripped = line.strip()
+        # Drop meta-commentary prefix lines (e.g. "Here is the output")
+        if _META_PREFIX_PATTERN.match(stripped):
+            removed = True
+            continue
+        # Handle structural heading labels
         if _HEADING_PATTERN.match(stripped):
             # Try to preserve any content that appears after the heading label
             remainder = _label_re.sub("", stripped).strip()
@@ -356,7 +401,8 @@ class AgentEngine:
         """Validate that the generated post follows the viral architecture.
 
         Returns False if the post is missing any required element OR if it
-        still contains structural section-heading labels (e.g. "The Hook:").
+        still contains structural section-heading labels (e.g. "The Hook:")
+        or meta-commentary prefixes (e.g. "Here is the output").
         """
         if not text.endswith(_REQUIRED_CTA):
             return False
@@ -366,11 +412,18 @@ class AgentEngine:
             return False
         if _REQUIRED_BULLET not in text:
             return False
-        # Fail if the LLM included structural headings that should not appear
-        # in the final post shown to the user.
+        # Fail if the LLM included structural headings or meta-commentary
+        # that should not appear in the final post shown to the user.
         for line in text.splitlines():
-            if _HEADING_PATTERN.match(line.strip()):
+            stripped = line.strip()
+            if _HEADING_PATTERN.match(stripped):
                 return False
+            if _META_PREFIX_PATTERN.match(stripped):
+                return False
+        # Fail if the post is still wrapped in code fences
+        stripped_text = text.strip()
+        if stripped_text.startswith("```") or stripped_text.startswith("~~~"):
+            return False
         return True
 
     def generate_viral_linkedin_post(self, topic: str) -> Optional[str]:
@@ -393,48 +446,62 @@ class AgentEngine:
 
             post, was_cleaned = _cleanup_post(raw_post) if raw_post else ("", False)
             if was_cleaned:
-                self.log("info", "🧹 Cleanup applied: removed structural heading lines / fixed CTA.")
+                self.log("info", "🧹 Cleanup applied: removed structural heading lines / meta-commentary / fixed CTA.")
 
             if post and self._validate_post(post):
                 self.log("success", "✅ Post generated and validated successfully.")
                 return post
 
             # Check the raw output (before cleanup) to determine whether the
-            # failure was caused by heading labels — cleanup may have already
-            # removed them from `post`, so `raw_post` is the authoritative source.
+            # failure was caused by heading labels or meta-commentary prefixes —
+            # cleanup may have already removed them from `post`, so `raw_post`
+            # is the authoritative source.
             heading_detected = bool(raw_post) and any(
                 _HEADING_PATTERN.match(ln.strip()) for ln in raw_post.splitlines()
+            )
+            meta_detected = bool(raw_post) and any(
+                _META_PREFIX_PATTERN.match(ln.strip()) for ln in raw_post.splitlines()
+            )
+            issue_label = (
+                " (heading labels detected)" if heading_detected
+                else " (meta-commentary detected)" if meta_detected
+                else ""
             )
             self.log(
                 "warning",
                 "⚠️  Post failed validation"
-                + (" (heading labels detected)" if heading_detected else "")
+                + issue_label
                 + " – retrying with stricter instruction...",
             )
 
-            retry_suffix = (
-                "\n\nIMPORTANT CORRECTION – your previous response was rejected because it "
-                "contained structural section labels (e.g. '**The Hook:**', 'The Transition:', etc.). "
-                "Output ONLY the final post text. "
-                "Do NOT include any section headers or labels whatsoever. "
-                f"The post must end exactly with '{_REQUIRED_CTA}', "
-                f"include '{_REQUIRED_HOOK_EMOJI}' in the hook, "
-                f"include '{_REQUIRED_TRANSITION}' in a transition line, "
-                f"and use '{_REQUIRED_BULLET}' for every bullet point."
-            ) if heading_detected else (
-                f"\n\nFix formatting strictly: "
-                f"ensure the post ends exactly with '{_REQUIRED_CTA}', "
-                f"includes '{_REQUIRED_HOOK_EMOJI}' in the hook, "
-                f"includes '{_REQUIRED_TRANSITION}' in a transition line, "
-                f"and uses '{_REQUIRED_BULLET}' for bullet points. "
-                "Output ONLY the final post text with no section headers."
-            )
+            if heading_detected or meta_detected:
+                retry_suffix = (
+                    "\n\nIMPORTANT CORRECTION – your previous response was rejected because it "
+                    "contained structural section labels (e.g. '**The Hook:**', 'The Transition:', etc.) "
+                    "and/or meta-commentary (e.g. 'Here is the output', 'Output:'). "
+                    "Output ONLY the final post text. "
+                    "Do NOT include any section headers, labels, or commentary of any kind. "
+                    "Do NOT prefix your response with 'Here is' or 'Output:' or any similar phrase. "
+                    f"The post must end exactly with '{_REQUIRED_CTA}', "
+                    f"include '{_REQUIRED_HOOK_EMOJI}' in the hook, "
+                    f"include '{_REQUIRED_TRANSITION}' in a transition line, "
+                    f"and use '{_REQUIRED_BULLET}' for every bullet point."
+                )
+            else:
+                retry_suffix = (
+                    f"\n\nFix formatting strictly: "
+                    f"ensure the post ends exactly with '{_REQUIRED_CTA}', "
+                    f"includes '{_REQUIRED_HOOK_EMOJI}' in the hook, "
+                    f"includes '{_REQUIRED_TRANSITION}' in a transition line, "
+                    f"and uses '{_REQUIRED_BULLET}' for bullet points. "
+                    "Output ONLY the final post text with no section headers or meta-commentary."
+                )
 
             retry_raw = self._generate_with_ollama(prompt + retry_suffix, model=model)
             if retry_raw:
                 post, retry_cleaned = _cleanup_post(retry_raw)
                 if retry_cleaned:
-                    self.log("info", "🧹 Cleanup applied on retry output: removed heading lines / fixed CTA.")
+                    self.log("info", "🧹 Cleanup applied on retry output: removed heading lines / meta-commentary / fixed CTA.")
                 if not self._validate_post(post):
                     self.log("warning", "⚠️  Retry also failed validation – using output anyway.")
                 else:
@@ -484,6 +551,8 @@ class AgentEngine:
             self.log("error", "❌ Playwright not installed. Run: pip install playwright && playwright install chromium")
             return False
 
+        keep_open = os.environ.get("KEEP_BROWSER_OPEN", "").strip() in ("1", "true", "yes")
+
         try:
             self.log("info", "🌐 Launching browser (persistent session)...")
             with sync_playwright() as pw:
@@ -491,14 +560,15 @@ class AgentEngine:
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
                 self.log("info", "📍 Navigating to LinkedIn feed...")
-                page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+                page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(3000)
 
                 # Detect login wall
                 if "login" in page.url or "signup" in page.url:
                     self.log("warning", "⚠️  Not logged in. Browser will open – please log in and re-run.")
                     page.wait_for_timeout(60000)
-                    ctx.close()
+                    if not keep_open:
+                        ctx.close()
                     return False
 
                 # Open post composer
@@ -552,15 +622,40 @@ class AgentEngine:
                     )
                 page.wait_for_timeout(1500)
 
-                # Type content into editor
-                self.log("info", "📝 Typing post content...")
+                # Fill content into editor — prefer fill() for instant insertion;
+                # fall back to clipboard paste via evaluate, then slow type as
+                # last resort.
+                self.log("info", "📝 Filling post content...")
                 editor = page.locator(
                     ".ql-editor, "
                     "[data-placeholder='What do you want to talk about?'], "
                     "[contenteditable='true']"
                 ).first
                 editor.click()
-                editor.type(content, delay=20)
+                filled = False
+                try:
+                    editor.fill(content)
+                    filled = True
+                    self.log("info", "✅ Content filled instantly via fill().")
+                except Exception as fill_err:
+                    self.log("warning", f"⚠️  fill() failed ({fill_err}), trying evaluate innerText…")
+
+                if not filled:
+                    try:
+                        editor.evaluate(
+                            "(el, text) => { el.innerText = text; "
+                            "el.dispatchEvent(new Event('input', {bubbles: true})); }",
+                            content,
+                        )
+                        filled = True
+                        self.log("info", "✅ Content set via evaluate innerText.")
+                    except Exception as eval_err:
+                        self.log("warning", f"⚠️  evaluate() failed ({eval_err}), falling back to type()…")
+
+                if not filled:
+                    editor.type(content, delay=5)
+                    self.log("info", "✅ Content typed with low delay fallback.")
+
                 page.wait_for_timeout(1000)
 
                 # Submit post
@@ -569,15 +664,56 @@ class AgentEngine:
                     "button.share-actions__primary-action, "
                     "button:has-text('Post')"
                 ).last
-                post_btn.click(timeout=10000)
-                page.wait_for_timeout(3000)
+                post_btn.click(timeout=30000)
+
+                # Wait for the composer to disappear or a success toast to appear
+                # (signals that LinkedIn has accepted the post).
+                posted = False
+                try:
+                    page.wait_for_selector(
+                        "div.share-box-modal__container",
+                        state="detached",
+                        timeout=15000,
+                    )
+                    posted = True
+                    self.log("info", "✅ Composer closed — post submitted.")
+                except Exception:
+                    pass
+
+                if not posted:
+                    # Fallback: try waiting for a visible toast
+                    for toast_sel in (
+                        ".artdeco-toast-item--visible",
+                        "[data-test-id='post-success-toast']",
+                        "div[role='alert']",
+                    ):
+                        try:
+                            page.wait_for_selector(toast_sel, state="visible", timeout=10000)
+                            posted = True
+                            self.log("info", f"✅ Success toast detected ({toast_sel}).")
+                            break
+                        except Exception:
+                            continue
+
+                if not posted:
+                    # Final fallback: fixed delay
+                    self.log("info", "⏳ No success signal detected; waiting 5 s as fallback…")
+                    page.wait_for_timeout(5000)
 
                 self.log("success", "✅ Post published successfully!")
-                ctx.close()
+                if not keep_open:
+                    ctx.close()
                 return True
 
         except Exception as exc:
             self.log("error", f"❌ Failed to post: {exc}")
+            if keep_open:
+                self.log("info", "🔍 KEEP_BROWSER_OPEN=1 – browser kept open for inspection.")
+                try:
+                    # Keep the event loop alive so the browser window stays open
+                    input("Press Enter to close the browser and exit…")
+                except Exception:
+                    pass
             return False
 
     # ------------------------------------------------------------------

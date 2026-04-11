@@ -17,6 +17,8 @@ import json
 import time
 import argparse
 import os
+import urllib.request
+import urllib.error
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -29,6 +31,63 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Viral LinkedIn post prompt template (verbatim)
+# ---------------------------------------------------------------------------
+
+VIRAL_PROMPT_TEMPLATE = """**Role:**
+Act as an elite expert and an undisputed LinkedIn Top Voice. You write exactly like the top 1% of growth hackers on the internet.
+
+**Objective:**
+Write a highly engaging, viral LinkedIn post based on the provided topic. Your writing is not just engaging; it is engineered for pure virality and pure algorithmic leverage.
+
+**Context:**
+You are dropping inside knowledge that the general public is missing. There is no fluff in your writing—only short, ruthless sentences, relentless pacing, extreme whitespace, and hooks that physically force people to stop scrolling.
+
+**Instructions:**
+**Instruction 1: The Viral Architecture (Follow this exact sequence)**
+* **The Hook:** 1 to 2 short lines. Start with a bold, contrarian, or massive claim. End the hook with the 🤯 emoji.
+* **The Transition:** Always use a variation of "Here is the thing ↓ " or "Here's what happened ↓ "
+* **The Setup:** 3-4 short lines building the context or the problem. Use phrases like "Read that again." or "Not kidding." or "Let me break it down."
+* **The Core Insight (The Meat):** Use a list format but ONLY use the `->` symbol for bullet points. Keep each bullet under 15 words.
+* **The Twist/Climax:** Introduce the mind-blowing part. Use phrases like "Now here is where it gets insane." or "But here is the thing most people miss."
+* **The Takeaway:** A 2-3 line summary of the broader philosophical or professional impact.
+* **The CTA:** End exactly with: "Thoughts? 👇"
+
+**Instruction 2: Formatting & Spacing (CRUCIAL)**
+* **Broetry Format:** NEVER write a paragraph longer than 1 to 2 sentences.
+* Hit 'Enter' twice after almost every single sentence to create extreme whitespace.
+* Never use traditional bullet points, only the `->` symbol.
+
+**Instruction 3: Tone & Vocabulary**
+* **Tone:** Authoritative, urgent, dramatic, and slightly informal.
+* **Signature Phrases:** Sprinkle in "Not kidding.", "To be frank,", "Let that sit for a second.", "Here is the thing ↓", "Read that again."
+* **Complexity:** Keep the reading level at a 6th-grade level. Strip out all corporate jargon. Use short, punchy verbs.
+
+**Instruction 4: Emoji Rules**
+* Do not overdo emojis. Keep it extremely clean.
+* Approved emojis: 🤯 (in the hook), ↓ (for transitions), 👇 (for the CTA).
+
+**Input:**
+**Topic:** {topic}
+
+**Notes:**
+* **Note 1:** The post must look incredibly long and highly skimmable due to the relentless spacing.
+* **Note 2:** Do not deviate from the exact CTA phrasing provided.
+* **Note 3:** Once the topic is provided, generate the post immediately, adhering to every single rule above."""
+
+
+# ---------------------------------------------------------------------------
+# Post validation constants
+# ---------------------------------------------------------------------------
+
+_REQUIRED_CTA = "Thoughts? 👇"
+_REQUIRED_HOOK_EMOJI = "🤯"
+_REQUIRED_TRANSITION = "↓"
+_REQUIRED_BULLET = "->"
+_MIN_RSS_TITLE_LENGTH = 15
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -36,6 +95,14 @@ def _default_profile_dir() -> str:
     """Return a stable directory to store the Chromium user profile."""
     base = os.environ.get("APPDATA") or os.path.expanduser("~/.local/share")
     return os.path.join(base, "personaliz-assistant", "linkedin-profile")
+
+
+def _app_data_dir() -> str:
+    """Return the app data directory for storing state files."""
+    base = os.environ.get("APPDATA") or os.path.expanduser("~/.local/share")
+    path = os.path.join(base, "personaliz-assistant")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -61,11 +128,32 @@ class AgentEngine:
         print(f"[{timestamp}] {level.upper()}: {display}", file=sys.stderr)
 
     # ------------------------------------------------------------------
+    # Topic state helpers (avoid repeating the same topic each run)
+    # ------------------------------------------------------------------
+
+    def _state_file_path(self) -> str:
+        return os.path.join(_app_data_dir(), "trending_topic_state.json")
+
+    def _load_topic_state(self) -> Dict[str, Any]:
+        try:
+            with open(self._state_file_path(), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_topic_state(self, state: Dict[str, Any]) -> None:
+        try:
+            with open(self._state_file_path(), "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.log("warning", f"⚠️  Could not save topic state: {exc}")
+
+    # ------------------------------------------------------------------
     # Content generation helpers
     # ------------------------------------------------------------------
 
     def search_trending_topics(self) -> List[str]:
-        self.log("info", "🔍 Searching for trending OpenClaw topics...")
+        self.log("info", "🔍 Searching for trending AI/automation topics...")
 
         # Try to fetch from real RSS feeds / curated sources
         topics = self._fetch_topics_from_rss()
@@ -75,11 +163,13 @@ class AgentEngine:
 
         # Fallback to curated hardcoded topics
         fallback_topics = [
-            "How OpenClaw is revolutionizing RPA automation",
-            "5 ways non-technical users can automate with OpenClaw",
-            "OpenClaw + Desktop: The future of no-code automation",
-            "Why OpenClaw is the easiest way to get started with browser automation",
-            "Automating LinkedIn workflows with OpenClaw – a practical guide",
+            "How AI agents are replacing entire workflows in 2025",
+            "The no-code automation revolution: what most people are missing",
+            "Why LLMs are the new operating system for knowledge workers",
+            "Local AI models: why running LLMs on your own hardware matters",
+            "Browser automation is eating the enterprise software market",
+            "The future of work: AI-assisted decision-making vs full automation",
+            "Why agentic AI is different from chatbots — and why it matters",
         ]
         self.log("info", f"ℹ️  Using {len(fallback_topics)} curated topics (no live feed available)")
         return fallback_topics
@@ -90,65 +180,153 @@ class AgentEngine:
         Returns an empty list on failure so the caller can fall back gracefully.
         Only uses the stdlib (no requests dependency required).
         """
-        import urllib.request
         import xml.etree.ElementTree as ET
 
-        # Public RSS feeds related to automation/AI/no-code
+        # Public RSS feeds related to automation/AI/no-code/productivity
         feeds = [
+            "https://hnrss.org/frontpage",           # Hacker News front page
+            "https://hnrss.org/newest?q=AI+automation",  # HN search: AI automation
+            "https://feeds.feedburner.com/venturebeat/SZYF",  # VentureBeat AI
+            "https://www.producthunt.com/feed",       # Product Hunt
             "https://zapier.com/engineering/feeds/rss/",
+            "https://medium.com/feed/tag/artificial-intelligence",
             "https://medium.com/feed/tag/automation",
         ]
+        seen: set = set()
         topics: List[str] = []
         for feed_url in feeds:
+            if len(topics) >= 20:
+                break
             try:
                 req = urllib.request.Request(
                     feed_url,
                     headers={"User-Agent": "personaliz-assistant/1.0"},
                 )
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with urllib.request.urlopen(req, timeout=6) as resp:
                     data = resp.read().decode("utf-8", errors="replace")
                 root = ET.fromstring(data)
-                ns = {"atom": "http://www.w3.org/2005/Atom"}
                 # RSS <item><title> or Atom <entry><title>
                 for item in root.iter("item"):
                     title = item.findtext("title", "").strip()
-                    if title and len(title) > 10:
+                    if title and len(title) > _MIN_RSS_TITLE_LENGTH and title not in seen:
+                        seen.add(title)
                         topics.append(title)
-                    if len(topics) >= 5:
-                        break
                 for entry in root.iter("{http://www.w3.org/2005/Atom}entry"):
                     title_el = entry.find("{http://www.w3.org/2005/Atom}title")
                     if title_el is not None and title_el.text:
-                        topics.append(title_el.text.strip())
-                    if len(topics) >= 5:
-                        break
-                if topics:
-                    break
+                        t = title_el.text.strip()
+                        if t and len(t) > _MIN_RSS_TITLE_LENGTH and t not in seen:
+                            seen.add(t)
+                            topics.append(t)
             except Exception:
                 continue
-        return topics[:5]
+        return topics[:20]
 
-    def generate_linkedin_posts(self, topics: List[str]) -> List[str]:
-        self.log("info", "✍️ Generating LinkedIn posts...")
-        posts = [
-            (
-                f"🚀 Just discovered something amazing: {topics[0]}\n\n"
-                "OpenClaw is making automation accessible to everyone, not just developers. "
-                "No coding required! 💡\n\n#OpenClaw #Automation #NoCode"
-            ),
-            (
-                f"Excited to share: {topics[1]}\n\n"
-                "If you've always wanted to automate repetitive tasks but didn't know how to code, "
-                "OpenClaw is changing the game! 🎯\n\n#Automation #Desktop"
-            ),
-            (
-                f"📌 Hot take: {topics[2]}\n\n"
-                "Combining OpenClaw with desktop automation unlocks incredible possibilities "
-                "for businesses of all sizes.\n\n#Innovation #RPA #Automation"
-            ),
-        ]
-        self.log("success", f"✅ Generated {len(posts)} post options")
-        return posts
+    # ------------------------------------------------------------------
+    # Ollama LLM generation
+    # ------------------------------------------------------------------
+
+    def _generate_with_ollama(self, prompt: str, model: str = "llama3:8b") -> str:
+        """Send a prompt to the local Ollama server and return the generated text.
+
+        Uses /api/chat endpoint with a single user message.
+        Falls back to /api/generate if /api/chat fails.
+        Raises an exception if both endpoints are unreachable or return an error.
+        """
+        ollama_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+        payload = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{ollama_url}/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        chat_error: Optional[Exception] = None
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                return result.get("message", {}).get("content", "").strip()
+        except urllib.error.URLError as exc:
+            chat_error = exc
+
+        # Try /api/generate as fallback
+        payload2 = json.dumps({
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+        }).encode("utf-8")
+        req2 = urllib.request.Request(
+            f"{ollama_url}/api/generate",
+            data=payload2,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req2, timeout=120) as resp2:
+                result2 = json.loads(resp2.read().decode("utf-8"))
+                return result2.get("response", "").strip()
+        except urllib.error.URLError as exc2:
+            raise RuntimeError(
+                f"Ollama unreachable at {ollama_url}. "
+                f"/api/chat error: {chat_error}; /api/generate error: {exc2}. "
+                "Ensure Ollama is running: ollama serve"
+            ) from exc2
+
+    def _validate_post(self, text: str) -> bool:
+        """Validate that the generated post follows the viral architecture."""
+        if not text.endswith(_REQUIRED_CTA):
+            return False
+        if _REQUIRED_HOOK_EMOJI not in text:
+            return False
+        if _REQUIRED_TRANSITION not in text:
+            return False
+        if _REQUIRED_BULLET not in text:
+            return False
+        return True
+
+    def generate_viral_linkedin_post(self, topic: str) -> Optional[str]:
+        """Generate a viral LinkedIn post for the given topic using local Ollama.
+
+        Returns the generated post text, or None if generation fails.
+        Retries once with a stricter instruction if validation fails.
+        """
+        self.log("info", f"🤖 Generating viral LinkedIn post for topic: {topic[:80]}...")
+        model = os.environ.get("OLLAMA_MODEL", "llama3:8b")
+
+        try:
+            prompt = VIRAL_PROMPT_TEMPLATE.format(topic=topic)
+            post = self._generate_with_ollama(prompt, model=model)
+
+            if post and self._validate_post(post):
+                self.log("success", "✅ Post generated and validated successfully.")
+                return post
+
+            self.log("warning", "⚠️  Post failed validation – retrying with stricter instruction...")
+            retry_prompt = (
+                prompt
+                + f"\n\nFix formatting strictly: "
+                f"ensure the post ends exactly with '{_REQUIRED_CTA}', "
+                f"includes '{_REQUIRED_HOOK_EMOJI}' in the hook, "
+                f"includes '{_REQUIRED_TRANSITION}' in a transition line, "
+                f"and uses '{_REQUIRED_BULLET}' for bullet points."
+            )
+            post = self._generate_with_ollama(retry_prompt, model=model)
+            if post:
+                if not self._validate_post(post):
+                    self.log("warning", "⚠️  Retry also failed validation – using output anyway.")
+                return post
+
+        except Exception as exc:
+            self.log("error", f"❌ Ollama generation failed: {exc}")
+            self.log("info", "ℹ️  Is Ollama running? Try: ollama serve && ollama pull llama3:8b")
+
+        return None
 
     # ------------------------------------------------------------------
     # Browser context (persistent login session)
@@ -714,32 +892,54 @@ class AgentEngine:
         self.log("info", "🚀 Starting LinkedIn Trending Agent...")
         try:
             topics = self.search_trending_topics()
-            posts = self.generate_linkedin_posts(topics)
 
-            if posts:
-                if self.sandbox:
-                    self.log("info", f"[SANDBOX] Preview post:\n{posts[0][:200]}")
-                    success = self.post_to_linkedin_browser(posts[0])
-                else:
-                    # Production: require explicit approval flag to prevent accidental posts
-                    if not approved:
-                        self.log("warning", "⚠️  Production mode requires human approval before posting.")
-                        return {
-                            "status": "pending_approval",
-                            "message": "Approval required before posting in production mode.",
-                            "logs": self.logs,
-                            "content": posts[0],
-                        }
-                    success = self.post_to_linkedin_browser(posts[0])
+            # Pick a topic that hasn't been used in the previous run
+            state = self._load_topic_state()
+            last_topic = state.get("last_topic", "")
+            chosen_topic = topics[0]
+            for t in topics:
+                if t != last_topic:
+                    chosen_topic = t
+                    break
+            self.log("info", f"📌 Chosen topic: {chosen_topic[:100]}")
 
-                if success:
+            # Generate viral post via local Ollama
+            post = self.generate_viral_linkedin_post(chosen_topic)
+
+            if not post:
+                self.log("warning", "⚠️  LLM generation failed – cannot post without generated content.")
+                return {
+                    "status": "error",
+                    "message": "Ollama LLM generation failed. Ensure Ollama is running: ollama serve && ollama pull llama3:8b",
+                    "logs": self.logs,
+                }
+
+            # Persist topic so next run skips it
+            self._save_topic_state({"last_topic": chosen_topic})
+
+            if self.sandbox:
+                self.log("info", f"[SANDBOX] Preview post:\n\n{post}")
+                success = self.post_to_linkedin_browser(post)
+            else:
+                # Production: require explicit approval flag to prevent accidental posts
+                if not approved:
+                    self.log("warning", "⚠️  Production mode requires human approval before posting.")
                     return {
-                        "status": "success",
-                        "message": "✅ LinkedIn Trending Agent completed. Posted to LinkedIn.",
+                        "status": "pending_approval",
+                        "message": "Approval required before posting in production mode.",
                         "logs": self.logs,
-                        "posted": 1,
-                        "content": posts[0],
+                        "content": post,
                     }
+                success = self.post_to_linkedin_browser(post)
+
+            if success:
+                return {
+                    "status": "success",
+                    "message": "✅ LinkedIn Trending Agent completed. Posted to LinkedIn.",
+                    "logs": self.logs,
+                    "posted": 1,
+                    "content": post,
+                }
 
             return {
                 "status": "completed",

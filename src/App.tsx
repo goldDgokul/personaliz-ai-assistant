@@ -1437,7 +1437,23 @@ Perfect for non-technical users who want to automate their workflows!
         {/* LOGS TAB */}
         {activeTab === 'logs' && (
           <div className="logs-container">
-            <h2>Activity Logs</h2>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+              <h2 style={{ margin: 0 }}>Activity Logs</h2>
+              <button
+                className="check-btn"
+                style={{ marginLeft: 'auto', background: '#c0392b', color: '#fff' }}
+                onClick={async () => {
+                  if (!confirm('Clear all activity logs? This cannot be undone.')) return;
+                  try {
+                    await invoke('db_clear_logs', {});
+                  } catch (_) {}
+                  localStorage.removeItem('openclaw_logs');
+                  setLogs([]);
+                }}
+              >
+                🗑️ Clear Logs
+              </button>
+            </div>
             {logs.length === 0 ? (
               <p>No logs yet. Run an agent to see activity.</p>
             ) : (
@@ -1663,8 +1679,9 @@ Perfect for non-technical users who want to automate their workflows!
             <div className="settings-section">
               <h3>Reset</h3>
               <button
-                onClick={() => {
+                onClick={async () => {
                   if (confirm('Clear all data and restart onboarding?')) {
+                    try { await invoke('db_clear_logs', {}); } catch (_) {}
                     localStorage.clear();
                     setAgents([]);
                     setLogs([]);

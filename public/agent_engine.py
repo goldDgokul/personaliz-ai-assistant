@@ -17,10 +17,11 @@ import json
 import time
 import argparse
 import os
+import re
 import urllib.request
 import urllib.error
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 PLAYWRIGHT_AVAILABLE = False
 try:
@@ -73,7 +74,13 @@ You are dropping inside knowledge that the general public is missing. There is n
 **Notes:**
 * **Note 1:** The post must look incredibly long and highly skimmable due to the relentless spacing.
 * **Note 2:** Do not deviate from the exact CTA phrasing provided.
-* **Note 3:** Once the topic is provided, generate the post immediately, adhering to every single rule above."""
+* **Note 3:** Once the topic is provided, generate the post immediately, adhering to every single rule above.
+
+**CRITICAL OUTPUT RULE:**
+Output ONLY the final LinkedIn post text.
+Do NOT include section headers, labels, or meta-commentary of any kind.
+Do NOT prefix sections with labels such as "The Hook:", "The Transition:", "The Setup:", "The Core Insight:", "The Twist:", "The Takeaway:", "The CTA:", or any variation of these (with or without asterisks/markdown).
+The very first word of your response must be the first word of the post itself."""
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +92,73 @@ _REQUIRED_HOOK_EMOJI = "🤯"
 _REQUIRED_TRANSITION = "↓"
 _REQUIRED_BULLET = "->"
 _MIN_RSS_TITLE_LENGTH = 15
+
+# Regex that matches lines containing structural section headings produced by
+# LLMs when they "show their work".  Matches both markdown-bold variants
+# ("**The Hook:**") and plain-text variants ("The Hook:").
+# The optional `(?:\s*\([^)]+\))?` group matches parenthetical subtitles like
+# "(The Meat)" in "**The Core Insight (The Meat):**".
+_HEADING_PATTERN = re.compile(
+    r"^\*{0,2}The\s+(Hook|Transition|Setup|Core\s+Insight|Twist(?:/Climax)?|Climax|Takeaway|CTA)"
+    r"(?:\s*\([^)]+\))?\*{0,2}\s*:",
+    re.IGNORECASE,
+)
+
+
+def _cleanup_post(text: str) -> Tuple[str, bool]:
+    """Strip structural section-heading labels from a generated post.
+
+    Heading lines come in two forms:
+    1. Label + content on the same line:
+       ``**The Hook:** AI is eating every job. 🤯``  →  ``AI is eating every job. 🤯``
+    2. Label-only line followed by content on the next line(s):
+       ``**The Core Insight (The Meat):**``  →  line removed entirely
+
+    Returns ``(cleaned_text, was_cleaned)`` where ``was_cleaned`` is ``True``
+    when at least one label was removed or the trailing CTA was normalised.
+    The returned text is guaranteed to end with ``_REQUIRED_CTA``.
+    """
+    # Regex that strips only the label prefix while preserving any inline content
+    # that follows the colon on the same line.
+    _label_re = re.compile(
+        r"^\*{0,2}The\s+(?:Hook|Transition|Setup|Core\s+Insight|Twist(?:/Climax)?|Climax|Takeaway|CTA)"
+        r"(?:\s*\([^)]+\))?\*{0,2}\s*:\s*",
+        re.IGNORECASE,
+    )
+
+    lines = text.splitlines()
+    cleaned_lines = []
+    removed = False
+    for line in lines:
+        stripped = line.strip()
+        if _HEADING_PATTERN.match(stripped):
+            # Try to preserve any content that appears after the heading label
+            remainder = _label_re.sub("", stripped).strip()
+            removed = True
+            if remainder:
+                # Content followed the label on the same line — keep the content
+                cleaned_lines.append(remainder)
+            # else: label-only line — drop it entirely
+        else:
+            cleaned_lines.append(line)
+
+    cleaned = "\n".join(cleaned_lines).strip()
+
+    # Remove triple-or-more blank lines that may appear after stripping headings
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    # Ensure the post ends exactly with the required CTA
+    if not cleaned.endswith(_REQUIRED_CTA):
+        # If a CTA line exists somewhere near the end but with different
+        # trailing whitespace/content, normalise it; otherwise append it.
+        if "Thoughts?" in cleaned.split("\n")[-1]:
+            cleaned = cleaned.rsplit("Thoughts?", 1)[0] + _REQUIRED_CTA
+        else:
+            cleaned = cleaned.rstrip() + "\n\n" + _REQUIRED_CTA
+        removed = True
+
+    return cleaned, removed
+
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +353,11 @@ class AgentEngine:
             ) from exc2
 
     def _validate_post(self, text: str) -> bool:
-        """Validate that the generated post follows the viral architecture."""
+        """Validate that the generated post follows the viral architecture.
+
+        Returns False if the post is missing any required element OR if it
+        still contains structural section-heading labels (e.g. "The Hook:").
+        """
         if not text.endswith(_REQUIRED_CTA):
             return False
         if _REQUIRED_HOOK_EMOJI not in text:
@@ -288,38 +366,79 @@ class AgentEngine:
             return False
         if _REQUIRED_BULLET not in text:
             return False
+        # Fail if the LLM included structural headings that should not appear
+        # in the final post shown to the user.
+        for line in text.splitlines():
+            if _HEADING_PATTERN.match(line.strip()):
+                return False
         return True
 
     def generate_viral_linkedin_post(self, topic: str) -> Optional[str]:
         """Generate a viral LinkedIn post for the given topic using local Ollama.
 
         Returns the generated post text, or None if generation fails.
-        Retries once with a stricter instruction if validation fails.
+        Steps:
+        1. Generate with the viral prompt.
+        2. Apply cleanup (strip heading lines, ensure CTA) and log if it ran.
+        3. If the cleaned post still fails validation (missing required elements
+           or headings survived cleanup), retry once with a stronger instruction.
+        4. Apply cleanup again on the retry output and log the result.
         """
         self.log("info", f"🤖 Generating viral LinkedIn post for topic: {topic[:80]}...")
         model = os.environ.get("OLLAMA_MODEL", "llama3:8b")
 
         try:
             prompt = VIRAL_PROMPT_TEMPLATE.format(topic=topic)
-            post = self._generate_with_ollama(prompt, model=model)
+            raw_post = self._generate_with_ollama(prompt, model=model)
+
+            post, was_cleaned = _cleanup_post(raw_post) if raw_post else ("", False)
+            if was_cleaned:
+                self.log("info", "🧹 Cleanup applied: removed structural heading lines / fixed CTA.")
 
             if post and self._validate_post(post):
                 self.log("success", "✅ Post generated and validated successfully.")
                 return post
 
-            self.log("warning", "⚠️  Post failed validation – retrying with stricter instruction...")
-            retry_prompt = (
-                prompt
-                + f"\n\nFix formatting strictly: "
+            # Check the raw output (before cleanup) to determine whether the
+            # failure was caused by heading labels — cleanup may have already
+            # removed them from `post`, so `raw_post` is the authoritative source.
+            heading_detected = bool(raw_post) and any(
+                _HEADING_PATTERN.match(ln.strip()) for ln in raw_post.splitlines()
+            )
+            self.log(
+                "warning",
+                "⚠️  Post failed validation"
+                + (" (heading labels detected)" if heading_detected else "")
+                + " – retrying with stricter instruction...",
+            )
+
+            retry_suffix = (
+                "\n\nIMPORTANT CORRECTION – your previous response was rejected because it "
+                "contained structural section labels (e.g. '**The Hook:**', 'The Transition:', etc.). "
+                "Output ONLY the final post text. "
+                "Do NOT include any section headers or labels whatsoever. "
+                f"The post must end exactly with '{_REQUIRED_CTA}', "
+                f"include '{_REQUIRED_HOOK_EMOJI}' in the hook, "
+                f"include '{_REQUIRED_TRANSITION}' in a transition line, "
+                f"and use '{_REQUIRED_BULLET}' for every bullet point."
+            ) if heading_detected else (
+                f"\n\nFix formatting strictly: "
                 f"ensure the post ends exactly with '{_REQUIRED_CTA}', "
                 f"includes '{_REQUIRED_HOOK_EMOJI}' in the hook, "
                 f"includes '{_REQUIRED_TRANSITION}' in a transition line, "
-                f"and uses '{_REQUIRED_BULLET}' for bullet points."
+                f"and uses '{_REQUIRED_BULLET}' for bullet points. "
+                "Output ONLY the final post text with no section headers."
             )
-            post = self._generate_with_ollama(retry_prompt, model=model)
-            if post:
+
+            retry_raw = self._generate_with_ollama(prompt + retry_suffix, model=model)
+            if retry_raw:
+                post, retry_cleaned = _cleanup_post(retry_raw)
+                if retry_cleaned:
+                    self.log("info", "🧹 Cleanup applied on retry output: removed heading lines / fixed CTA.")
                 if not self._validate_post(post):
                     self.log("warning", "⚠️  Retry also failed validation – using output anyway.")
+                else:
+                    self.log("success", "✅ Retry post validated successfully.")
                 return post
 
         except Exception as exc:

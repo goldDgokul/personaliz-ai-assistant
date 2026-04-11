@@ -547,7 +547,7 @@ class AgentEngine:
 
         Set the environment variable ``KEEP_BROWSER_OPEN=1`` to prevent the
         browser window from closing on error (useful for debugging selector
-        issues or login-wall problems). The window will remain open for 60 s
+        issues or login-wall problems). The window will remain open for 60 seconds
         so you can inspect its state before it closes automatically.
         """
         if self.sandbox:
@@ -658,7 +658,7 @@ class AgentEngine:
 
                     self.log("success", "✅ Post published successfully!")
                     if keep_open:
-                        self.log("info", "🔍 KEEP_BROWSER_OPEN=1: keeping browser open for 60 s…")
+                        self.log("info", "🔍 KEEP_BROWSER_OPEN=1: keeping browser open for 60 seconds…")
                         page.wait_for_timeout(60000)
                     else:
                         ctx.close()
@@ -667,7 +667,7 @@ class AgentEngine:
                 except Exception as inner_exc:
                     self.log("error", f"❌ Failed to post: {inner_exc}")
                     if keep_open:
-                        self.log("info", "🔍 KEEP_BROWSER_OPEN=1: keeping browser open for 60 s for debugging…")
+                        self.log("info", "🔍 KEEP_BROWSER_OPEN=1: keeping browser open for 60 seconds for debugging…")
                         try:
                             page.wait_for_timeout(60000)
                         except Exception:

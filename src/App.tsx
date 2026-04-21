@@ -1052,6 +1052,7 @@ Keep responses concise (2-3 sentences max).`;
       <Onboarding onComplete={() => {
         localStorage.setItem('setup_completed', 'true');
         setIsOnboarding(false);
+        setActiveTab('chat');
         checkOllamaConnection();
         checkExternalLLM();
         setLocalModel(localStorage.getItem('local_model') || 'llama3');
@@ -1080,7 +1081,10 @@ Keep responses concise (2-3 sentences max).`;
             <button
               key={tab.id}
               className={`nav-btn ${activeTab === tab.id ? 'active' : ''}`}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => {
+                setActiveTab(tab.id);
+                if (tab.id === 'chat') setIsFloatingChatOpen(false);
+              }}
             >
               {tab.label}
             </button>
@@ -1303,10 +1307,19 @@ Keep responses concise (2-3 sentences max).`;
               </div>
             </div>
 
-            <p className="setting-description" style={{ marginBottom: '16px' }}>
-              Event triggers run an agent automatically when a condition fires – e.g. when a keyword appears
-              on a web page, or when a URL's content changes. They are polled every 60 seconds by the background scheduler.
-            </p>
+            <div className="setting-description" style={{ marginBottom: '16px' }}>
+              <p style={{ marginBottom: '8px' }}>
+                <strong>What is the Events tab?</strong> Event Triggers let your agents react automatically to things that happen on the web — no manual work required.
+              </p>
+              <ul style={{ margin: '0 0 4px 16px', fontSize: '13px', lineHeight: '1.6' }}>
+                <li><strong>Keyword found on page</strong> – runs an agent the moment a specific word or phrase appears on a URL you're watching.</li>
+                <li><strong>URL content changed</strong> – fires when any content on a page changes since the last check.</li>
+                <li><strong>New post / feed item detected</strong> – triggers on new items in a feed or listing page.</li>
+              </ul>
+              <p style={{ marginTop: '8px', fontSize: '13px', color: 'var(--text-secondary)' }}>
+                Triggers are polled every 60 seconds by the background scheduler. The <em>Event History</em> section below shows every time a trigger has fired and which agent was activated.
+              </p>
+            </div>
 
             {agents.length === 0 && (
               <div className="empty-state">
@@ -1776,7 +1789,8 @@ Keep responses concise (2-3 sentences max).`;
         </div>
       )}
 
-      {/* Floating Assistant Icon – always visible */}
+      {/* Floating Assistant Icon – visible on all tabs except chat */}
+      {activeTab !== 'chat' && (
       <button
         className={`floating-assistant-btn ${isChatOpen ? 'open' : ''}`}
         title={isFloatingChatOpen ? 'Close mini chat' : 'Open mini chat'}
@@ -1791,6 +1805,7 @@ Keep responses concise (2-3 sentences max).`;
       >
         {isFloatingChatOpen ? '✕' : '🤖'}
       </button>
+      )}
     </div>
   );
 }

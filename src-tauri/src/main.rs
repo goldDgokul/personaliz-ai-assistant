@@ -63,48 +63,6 @@ fn db_get_llm_usage(limit: Option<usize>) -> Result<Vec<db::LlmUsageRow>, String
 }
 
 // ============================================================
-// Heartbeats
-// ============================================================
-
-#[tauri::command]
-fn db_upsert_heartbeat(
-    agent_id: String,
-    interval_min: i64,
-    enabled: bool,
-) -> Result<String, String> {
-    let id = Uuid::new_v4().to_string();
-    let row = db::HeartbeatRow {
-        id: id.clone(),
-        agent_id,
-        interval_min,
-        enabled,
-        last_check: None,
-        created_at: Utc::now().to_rfc3339(),
-    };
-    db::upsert_heartbeat(&row).map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-#[tauri::command]
-fn db_list_heartbeats() -> Result<Vec<db::HeartbeatRow>, String> {
-    db::list_heartbeats().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn db_delete_heartbeat(id: String) -> Result<(), String> {
-    db::delete_heartbeat(&id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn db_get_heartbeat_runs(
-    agent_id: Option<String>,
-    limit: Option<usize>,
-) -> Result<Vec<db::HeartbeatRunRow>, String> {
-    db::get_heartbeat_runs(agent_id.as_deref(), limit.unwrap_or(100))
-        .map_err(|e| e.to_string())
-}
-
-// ============================================================
 // External LLM (OpenAI / Anthropic) – async HTTP via reqwest
 // ============================================================
 
@@ -628,35 +586,6 @@ fn install_openclaw() -> Result<String, String> {
     }
 }
 
-#[tauri::command]
-fn run_openclaw_command(command: String) -> Result<String, String> {
-    println!("Running OpenClaw command: {}", command);
-
-    let output = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", &command])
-            .output()
-    } else {
-        Command::new("sh")
-            .args(["-c", &command])
-            .output()
-    };
-
-    match output {
-        Ok(result) => {
-            if result.status.success() {
-                Ok(String::from_utf8_lossy(&result.stdout).to_string())
-            } else {
-                Err(format!(
-                    "Command failed: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                ))
-            }
-        }
-        Err(e) => Err(format!("Failed to execute command: {e}")),
-    }
-}
-
 // ============================================================
 // OpenClaw – run an agent via its config file
 // ============================================================
@@ -674,15 +603,35 @@ fn run_openclaw_agent(
 
     println!("[openclaw] Running: {command_str}");
 
-    let output = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", &command_str])
-            .output()
-    } else {
-        Command::new("sh")
-            .args(["-c", &command_str])
-            .output()
-    };
+    if !check_openclaw_installed() {
+        let finished_at = Utc::now().to_rfc3339();
+        let stderr = "OpenClaw is not installed. Run npm install -g openclaw.";
+        let _ = db::record_openclaw_run(
+            &agent_id,
+            &config_path,
+            &command_str,
+            "",
+            stderr,
+            None,
+            &started_at,
+            &finished_at,
+        );
+        let _ = db::append_log(&agent_id, "warning", &format!("[openclaw] {stderr}"), &finished_at);
+        return Ok(serde_json::json!({
+            "status": "skipped",
+            "reason": "openclaw_missing",
+            "stdout": "",
+            "stderr": stderr,
+            "exit_code": null,
+            "started_at": started_at,
+            "finished_at": finished_at,
+        }));
+    }
+
+    let output = Command::new("openclaw")
+        .arg("run")
+        .arg(&config_path)
+        .output();
 
     let finished_at = Utc::now().to_rfc3339();
 
@@ -742,56 +691,6 @@ fn db_get_openclaw_runs(
     limit: Option<usize>,
 ) -> Result<Vec<db::OpenClawRunRow>, String> {
     db::get_openclaw_runs(agent_id.as_deref(), limit.unwrap_or(100))
-        .map_err(|e| e.to_string())
-}
-
-// ============================================================
-// Event triggers
-// ============================================================
-
-#[tauri::command]
-fn db_upsert_event_trigger(
-    id: Option<String>,
-    agent_id: String,
-    trigger_type: String,
-    target_url: String,
-    keyword: Option<String>,
-    check_interval_min: Option<i64>,
-    enabled: Option<bool>,
-) -> Result<String, String> {
-    let trigger_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let row = db::EventTriggerRow {
-        id: trigger_id.clone(),
-        agent_id,
-        trigger_type,
-        target_url,
-        keyword,
-        check_interval_min: check_interval_min.unwrap_or(60),
-        enabled: enabled.unwrap_or(true),
-        last_checked: None,
-        last_hash: None,
-        created_at: Utc::now().to_rfc3339(),
-    };
-    db::upsert_event_trigger(&row).map_err(|e| e.to_string())?;
-    Ok(trigger_id)
-}
-
-#[tauri::command]
-fn db_list_event_triggers() -> Result<Vec<db::EventTriggerRow>, String> {
-    db::list_event_triggers().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn db_delete_event_trigger(id: String) -> Result<(), String> {
-    db::delete_event_trigger(&id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn db_get_event_history(
-    agent_id: Option<String>,
-    limit: Option<usize>,
-) -> Result<Vec<db::EventHistoryRow>, String> {
-    db::get_event_history(agent_id.as_deref(), limit.unwrap_or(100))
         .map_err(|e| e.to_string())
 }
 
@@ -1086,7 +985,6 @@ fn main() {
             // OpenClaw
             check_openclaw_installed,
             install_openclaw,
-            run_openclaw_command,
             // Python / Node / Playwright checks
             check_python_available,
             check_node_available,
@@ -1119,16 +1017,6 @@ fn main() {
             // OpenClaw agent runner + run log
             run_openclaw_agent,
             db_get_openclaw_runs,
-            // Event triggers
-            db_upsert_event_trigger,
-            db_list_event_triggers,
-            db_delete_event_trigger,
-            db_get_event_history,
-            // DB – heartbeats
-            db_upsert_heartbeat,
-            db_list_heartbeats,
-            db_delete_heartbeat,
-            db_get_heartbeat_runs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

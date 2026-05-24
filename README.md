@@ -12,17 +12,15 @@ A UI-first desktop automation assistant powered by **local AI (Llama 3 / Phi-3)*
 - **Chat-First Interface** – create automation agents by chatting (type "create agent" or just describe your task)
 - **Offline-first, local AI** – uses **llama3** / **phi3** via **Ollama** _or_ **llama.cpp** by default; no API key required
 - **External AI support** – set an OpenAI or Anthropic key in Settings to switch automatically; routing logged to SQLite
-- **Persistent floating assistant** – always-visible 🤖 FAB; opens a mini-chat overlay from any tab without leaving your current view
 - **Browser automation** – post to LinkedIn and comment on hashtag threads via Playwright
 - **Human-in-the-loop approval** – review and edit generated content before any production post; every decision persisted to the `approvals` audit table
 - **Sandbox mode** – simulate every action safely before going live
-- **SQLite persistence** – agents, schedules, logs, run history, LLM usage, heartbeats, and approval decisions stored locally
+- **SQLite persistence** – agents, schedules, logs, run history, LLM usage, and approval decisions stored locally
 - **Background scheduler** – cron-aware scheduler inside the Tauri runtime (60-second poll)
 - **Cron scheduling** – full 5-field cron expression support per-agent (validated live in the UI)
 - **Agent creation via chat** – wizard opens automatically when you describe a task; shows a JSON config preview in chat before confirming
 - **OpenClaw config generation** – every new agent writes an `openclaw.config.json` to `~/.local/share/personaliz-assistant/agents/<id>/`
 - **Chat-driven onboarding** – type `setup` in chat for a guided dependency help message; the onboarding wizard supports both Ollama and llama.cpp
-- **Heartbeat monitoring** – per-agent health checks polled every N minutes; results logged to SQLite
 - **Two demo agents** – LinkedIn Trending Poster (daily) + #openclaw Hashtag Commenter (hourly)
 
 ---
@@ -185,7 +183,6 @@ openclaw run ~/.local/share/personaliz-assistant/agents/<agent_id>/openclaw.conf
 |---------|---------|
 | `check_openclaw_installed` | Detects if `openclaw` is in PATH |
 | `install_openclaw` | Runs `npm install -g openclaw` |
-| `run_openclaw_command` | Executes arbitrary openclaw commands |
 | `create_openclaw_config` | Writes `openclaw.config.json` for an agent |
 
 ---
@@ -325,17 +322,6 @@ Visible in **Logs tab → Approval Audit Log**.
 
 ---
 
-## 💓 Heartbeat Monitoring
-
-Each agent can have a heartbeat enabled from the agent card:
-
-- **Enable**: click `💓 Heartbeat` (default: every 60 min)
-- **Disable**: click `💔 Heartbeat`
-- Results show in **Agents tab → Heartbeat Monitor** (refresh with 🔄)
-- All check outcomes appended to `logs` table for auditing
-
----
-
 ## 🗄️ SQLite Persistence
 
 Database path:
@@ -348,12 +334,8 @@ Database path:
 | `schedules` | Run schedules (frequency, `cron_expression`, enabled, next_run) |
 | `logs` | Append-only execution log |
 | `run_history` | Per-invocation outcome records |
-| `heartbeats` | Per-agent heartbeat config |
-| `heartbeat_runs` | Historical heartbeat check results |
 | `llm_usage` | Which provider/model was used for each LLM call |
 | `approvals` | Human approval decisions (outcome, content preview) |
-| `event_triggers` | Generic event trigger definitions (type, URL, keyword, interval) |
-| `event_history` | One row per event trigger firing |
 | `openclaw_runs` | Per-invocation OpenClaw CLI stdout/stderr capture |
 
 ---
@@ -402,16 +384,16 @@ Log into LinkedIn **once** — the session is reused on subsequent runs.
 ```
 personaliz-ai-assistant/
 ├── src/                              React + TypeScript frontend
-│   ├── App.tsx                       Main app (Chat, Agents, Events, Logs, Settings + floating mini-chat)
+│   ├── App.tsx                       Main app (Chat, Agents, Logs, Settings)
 │   └── components/
 │       ├── Onboarding.tsx            5-step wizard (Ollama or llama.cpp, OpenClaw, API keys)
 │       ├── AgentCreationModal.tsx    4-step wizard incl. cron expression input + live validation
 │       └── ApprovalModal.tsx         Human-in-the-loop review (logs outcome to DB)
 ├── src-tauri/
 │   └── src/
-│       ├── main.rs                   All Tauri commands (incl. run_openclaw_agent, event triggers)
+│       ├── main.rs                   All Tauri commands (incl. run_openclaw_agent)
 │       ├── db.rs                     SQLite layer (rusqlite) – 11 tables
-│       └── scheduler.rs              Background scheduler + cron parser + heartbeat + event trigger checks
+│       └── scheduler.rs              Background scheduler + cron parser
 └── public/
     └── agent_engine.py               Python Playwright automation engine (with RSS topic fetching)
 ```
@@ -425,57 +407,15 @@ personaliz-ai-assistant/
 | `send_message_to_llm` | Send message to local Ollama; logs usage to SQLite |
 | `send_message_to_external_llm` | Send message to OpenAI or Anthropic; logs usage to SQLite |
 | `post_to_linkedin` / `comment_linkedin_hashtag` | LinkedIn automation via agent_engine.py |
-| `check_openclaw_installed` / `install_openclaw` / `run_openclaw_command` | OpenClaw dependency management |
+| `check_openclaw_installed` / `install_openclaw` | OpenClaw dependency management |
 | `create_openclaw_config` | Writes `openclaw.config.json` for an agent |
 | `run_openclaw_agent` | Runs `openclaw run <config_path>` and stores stdout/stderr in `openclaw_runs` table |
 | `db_get_openclaw_runs` | Returns stored OpenClaw run records |
 | `validate_cron_expression` | Validates a 5-field cron expression and returns next run time |
 | `db_upsert_schedule` | Upsert schedule (supports `cron_expression` field) |
 | `db_record_approval` / `db_list_approvals` | Approval audit log CRUD |
-| `db_upsert_heartbeat` / `db_list_heartbeats` / `db_delete_heartbeat` | Heartbeat config CRUD |
-| `db_get_heartbeat_runs` | Heartbeat history |
-| `db_upsert_event_trigger` / `db_list_event_triggers` / `db_delete_event_trigger` | Event trigger CRUD |
-| `db_get_event_history` | Event trigger firing history |
 | `check_node_available` / `check_python_available` / `check_playwright_available` | Dependency detection |
 | `get_os_info` | Returns OS platform and arch |
-
----
-
-## ⚡ Event Triggers (Generic Event Handler)
-
-Event triggers run an agent automatically when a web condition fires. They are polled every 60 seconds by the Rust scheduler alongside regular cron schedules.
-
-### Trigger types
-
-| Type | What it does |
-|------|-------------|
-| `keyword_found` | Fetches a URL, fires the agent if the keyword appears in the page body |
-| `url_change` | Fires if the page content has changed since last check (FNV hash comparison) |
-| `new_post` | Fires when new RSS/feed items appear at the target URL |
-
-### How it works internally
-
-```
-Scheduler loop (every 60s)
-  └── run_due_event_triggers()
-        ├── For each enabled trigger
-        │     ├── Check if check_interval_min has elapsed since last_checked
-        │     ├── HTTP GET target_url (blocking, stdlib only, http:// only)
-        │     ├── Compare against last_hash / search for keyword
-        │     ├── If triggered → record_event_history + run agent Python
-        │     └── Update last_checked and last_hash in SQLite
-```
-
-### SQLite tables
-
-| Table | Contents |
-|-------|----------|
-| `event_triggers` | Trigger definitions (type, URL, keyword, interval, enabled) |
-| `event_history` | One row per firing (trigger_id, agent_id, fired_at, matched_content) |
-
-### UI
-
-Create and manage triggers in the **⚡ Events** tab. View firing history below the trigger list.
 
 ---
 
@@ -535,12 +475,10 @@ MIT © 2024 Personaliz
 | **OpenClaw CLI integration** | `create_openclaw_config` writes `openclaw.config.json`; `run_openclaw_agent` invokes `openclaw run <path>` and captures stdout/stderr in `openclaw_runs` table |
 | **Chat-driven setup** | Type `setup` in chat → live dependency scan; type `install openclaw` → runs install |
 | **Cron scheduling** | Full 5-field cron expressions stored in SQLite; validated live in UI; next run preview |
-| **Event triggers** | Generic event handler (keyword found / URL change / new post) — managed in ⚡ Events tab |
 | **NL→config→deploy** | Type `create agent` / describe a task → JSON config preview in chat → type `confirm` to deploy |
 | **Approval audit** | Every approval/rejection recorded in `approvals` table; visible in Logs tab |
 | **OpenClaw runs log** | Every `openclaw run` stdout/stderr stored in `openclaw_runs` table; visible in Logs tab |
 | **Sandbox mode** | Enabled by default; toggle in Settings |
 | **Local LLM** | Ollama (phi3 / llama3) _or_ llama.cpp (`llama-server`) — configured in onboarding |
 | **External LLM** | OpenAI / Anthropic / Google AI — set API key in Settings |
-| **Floating assistant** | 🤖 FAB always visible; opens mini-chat overlay on all tabs; `z-index: 10001` |
 | **Documentation** | This README — covers all integration points, CLI commands, model routing, tables |

@@ -47,23 +47,6 @@ interface RunHistoryEntry {
   result?: string;
 }
 
-interface HeartbeatRow {
-  id: string;
-  agent_id: string;
-  interval_min: number;
-  enabled: boolean;
-  last_check: string | null;
-  created_at: string;
-}
-
-interface HeartbeatRunRow {
-  id: number;
-  agent_id: string;
-  checked_at: string;
-  status: string;
-  message: string | null;
-}
-
 interface LlmUsageRow {
   id: number;
   provider: string;
@@ -79,27 +62,6 @@ interface ApprovalRow {
   outcome: string;
   decided_at: string;
   notes: string | null;
-}
-
-interface EventTriggerRow {
-  id: string;
-  agent_id: string;
-  trigger_type: string;
-  target_url: string;
-  keyword: string | null;
-  check_interval_min: number;
-  enabled: boolean;
-  last_checked: string | null;
-  created_at: string;
-}
-
-interface EventHistoryRow {
-  id: number;
-  trigger_id: string;
-  agent_id: string;
-  fired_at: string;
-  matched_content: string | null;
-  status: string;
 }
 
 interface OpenClawRunRow {
@@ -132,32 +94,12 @@ function App() {
   const [useExternalLLM, setUseExternalLLM] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [localModel, setLocalModel] = useState('llama3');
-  const [heartbeats, setHeartbeats] = useState<HeartbeatRow[]>([]);
-  const [heartbeatRuns, setHeartbeatRuns] = useState<HeartbeatRunRow[]>([]);
   const [llmUsage, setLlmUsage] = useState<LlmUsageRow[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRow[]>([]);
   const [pendingAgentConfigPreview, setPendingAgentConfigPreview] = useState<{
     name: string; role: string; goal: string; tools: string[]; schedule: string; sandbox: boolean;
   } | null>(null);
-  const [eventTriggers, setEventTriggers] = useState<EventTriggerRow[]>([]);
-  const [eventHistory, setEventHistory] = useState<EventHistoryRow[]>([]);
   const [openClawRuns, setOpenClawRuns] = useState<OpenClawRunRow[]>([]);
-
-  // Event trigger creation form state
-  const [showEventTriggerForm, setShowEventTriggerForm] = useState(false);
-  const [newTriggerAgentId, setNewTriggerAgentId] = useState('');
-  const [newTriggerType, setNewTriggerType] = useState('keyword_found');
-  const [newTriggerUrl, setNewTriggerUrl] = useState('');
-  const [newTriggerKeyword, setNewTriggerKeyword] = useState('');
-  const [newTriggerInterval, setNewTriggerInterval] = useState(60);
-
-  // Floating mini-chat overlay (visible on any tab)
-  const [isFloatingChatOpen, setIsFloatingChatOpen] = useState(false);
-  const [floatingInput, setFloatingInput] = useState('');
-  const floatingMessagesEndRef = useRef<HTMLDivElement>(null);
-
-  // Floating assistant icon state (legacy toggle, kept for backward compat)
-  const [isChatOpen, setIsChatOpen] = useState(true);
 
   // Approval modal
   const [showApprovalModal, setShowApprovalModal] = useState(false);
@@ -235,16 +177,6 @@ function App() {
     } catch (_) {}
 
     try {
-      const hbs = await invoke<HeartbeatRow[]>('db_list_heartbeats');
-      setHeartbeats(hbs);
-    } catch (_) {}
-
-    try {
-      const hbRuns = await invoke<HeartbeatRunRow[]>('db_get_heartbeat_runs', { limit: 50 });
-      setHeartbeatRuns(hbRuns);
-    } catch (_) {}
-
-    try {
       const usage = await invoke<LlmUsageRow[]>('db_get_llm_usage', { limit: 50 });
       setLlmUsage(usage);
     } catch (_) {}
@@ -252,16 +184,6 @@ function App() {
     try {
       const approvs = await invoke<ApprovalRow[]>('db_list_approvals', { limit: 100 });
       setApprovals(approvs);
-    } catch (_) {}
-
-    try {
-      const triggers = await invoke<EventTriggerRow[]>('db_list_event_triggers');
-      setEventTriggers(triggers);
-    } catch (_) {}
-
-    try {
-      const evtHist = await invoke<EventHistoryRow[]>('db_get_event_history', { limit: 50 });
-      setEventHistory(evtHist);
     } catch (_) {}
 
     try {
@@ -514,7 +436,7 @@ Keep responses concise (2-3 sentences max).`;
           content: '⏳ Running `npm install -g openclaw`… This may take a minute.',
         }]);
         try {
-          const result = await invoke<string>('run_openclaw_command', { command: 'install' });
+          const result = await invoke<string>('install_openclaw');
           setMessages(prev => [...prev, {
             role: 'assistant',
             content: `✅ OpenClaw installed!\n\n\`\`\`\n${result}\n\`\`\`\n\nYou're ready to go! Type **"add demo agents"** to get started.`,
@@ -724,56 +646,6 @@ Keep responses concise (2-3 sentences max).`;
     try { await invoke('db_delete_agent', { id: agentId }); } catch (_) {}
   };
 
-  // -------------------------------------------------------------------------
-  // Event triggers CRUD
-  // -------------------------------------------------------------------------
-
-  const createEventTrigger = async () => {
-    if (!newTriggerAgentId || !newTriggerUrl) return;
-    if (!newTriggerUrl.startsWith('http://')) {
-      addLog('system', 'error', 'Event trigger URL must start with http:// (TLS not supported in built-in poller)');
-      return;
-    }
-    try {
-      const id = await invoke<string>('db_upsert_event_trigger', {
-        agentId: newTriggerAgentId,
-        triggerType: newTriggerType,
-        targetUrl: newTriggerUrl,
-        keyword: newTriggerKeyword || null,
-        checkIntervalMin: newTriggerInterval,
-        enabled: true,
-      });
-      const newTrigger: EventTriggerRow = {
-        id,
-        agent_id: newTriggerAgentId,
-        trigger_type: newTriggerType,
-        target_url: newTriggerUrl,
-        keyword: newTriggerKeyword || null,
-        check_interval_min: newTriggerInterval,
-        enabled: true,
-        last_checked: null,
-        created_at: new Date().toISOString(),
-      };
-      setEventTriggers(prev => [newTrigger, ...prev]);
-      const agent = agents.find(a => a.id === newTriggerAgentId);
-      addLog(newTriggerAgentId, 'success', `Event trigger created for "${agent?.name}" (${newTriggerType})`);
-      setShowEventTriggerForm(false);
-      setNewTriggerUrl('');
-      setNewTriggerKeyword('');
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addLog('system', 'error', `Failed to create event trigger: ${msg}`);
-    }
-  };
-
-  const deleteEventTrigger = async (triggerId: string) => {
-    try {
-      await invoke('db_delete_event_trigger', { id: triggerId });
-      setEventTriggers(prev => prev.filter(t => t.id !== triggerId));
-      addLog('system', 'info', 'Event trigger deleted');
-    } catch (_) {}
-  };
-
   const refreshOpenClawRuns = async () => {
     try {
       const runs = await invoke<OpenClawRunRow[]>('db_get_openclaw_runs', { limit: 50 });
@@ -823,9 +695,12 @@ Keep responses concise (2-3 sentences max).`;
           outputDir: null,
         });
         addLog(agentId, 'info', `📄 OpenClaw config: ${configPath}`);
-        openClawResult = await invoke<any>('run_openclaw_agent', { agentId, configPath });
-        addLog(agentId, openClawResult.status === 'success' ? 'success' : 'warning',
-          `[OpenClaw] exit=${openClawResult.exit_code ?? '?'} ${(openClawResult.stdout || openClawResult.stderr || '').slice(0, 200)}`);
+        const openClawRun = await invoke<any>('run_openclaw_agent', { agentId, configPath });
+        addLog(agentId, openClawRun.status === 'success' ? 'success' : 'warning',
+          `[OpenClaw] exit=${openClawRun.exit_code ?? '?'} ${(openClawRun.stdout || openClawRun.stderr || '').slice(0, 200)}`);
+        if (openClawRun.status === 'success') {
+          openClawResult = openClawRun;
+        }
         // Refresh openclaw runs panel
         await refreshOpenClawRuns();
       } catch (_) {
@@ -988,53 +863,6 @@ Keep responses concise (2-3 sentences max).`;
   };
 
   // -------------------------------------------------------------------------
-  // Heartbeats
-  // -------------------------------------------------------------------------
-
-  const enableHeartbeat = async (agentId: string, intervalMin: number = 60) => {
-    try {
-      const id = await invoke<string>('db_upsert_heartbeat', {
-        agentId,
-        intervalMin,
-        enabled: true,
-      });
-      const newHb: HeartbeatRow = {
-        id,
-        agent_id: agentId,
-        interval_min: intervalMin,
-        enabled: true,
-        last_check: null,
-        created_at: new Date().toISOString(),
-      };
-      setHeartbeats(prev => [...prev.filter(h => h.agent_id !== agentId), newHb]);
-      const agent = agents.find(a => a.id === agentId);
-      addLog(agentId, 'success', `💓 Heartbeat enabled for "${agent?.name}" every ${intervalMin} min`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addLog(agentId, 'error', `❌ Failed to enable heartbeat: ${msg}`);
-    }
-  };
-
-  const disableHeartbeat = async (heartbeatId: string, agentId: string) => {
-    try {
-      await invoke('db_delete_heartbeat', { id: heartbeatId });
-      setHeartbeats(prev => prev.filter(h => h.id !== heartbeatId));
-      const agent = agents.find(a => a.id === agentId);
-      addLog(agentId, 'info', `💔 Heartbeat disabled for "${agent?.name}"`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addLog(agentId, 'error', `❌ Failed to disable heartbeat: ${msg}`);
-    }
-  };
-
-  const refreshHeartbeatRuns = async () => {
-    try {
-      const runs = await invoke<HeartbeatRunRow[]>('db_get_heartbeat_runs', { limit: 50 });
-      setHeartbeatRuns(runs);
-    } catch (_) {}
-  };
-
-  // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
 
@@ -1074,17 +902,13 @@ Keep responses concise (2-3 sentences max).`;
           {[
             { id: 'chat', label: '💬 Chat' },
             { id: 'agents', label: `🤖 Agents (${agents.length})` },
-            { id: 'events', label: `⚡ Events (${eventTriggers.length})` },
             { id: 'logs', label: '📊 Logs' },
             { id: 'settings', label: '⚙️ Settings' },
           ].map(tab => (
             <button
               key={tab.id}
               className={`nav-btn ${activeTab === tab.id ? 'active' : ''}`}
-              onClick={() => {
-                setActiveTab(tab.id);
-                if (tab.id === 'chat') setIsFloatingChatOpen(false);
-              }}
+              onClick={() => setActiveTab(tab.id)}
             >
               {tab.label}
             </button>
@@ -1186,10 +1010,8 @@ Keep responses concise (2-3 sentences max).`;
               </div>
             ) : (
               <div className="agents-grid">
-                {agents.map(agent => {
-                  const agentHeartbeat = heartbeats.find(h => h.agent_id === agent.id);
-                  return (
-                    <div key={agent.id} className="agent-card">
+                {agents.map(agent => (
+                  <div key={agent.id} className="agent-card">
                       <div className="agent-header">
                         <h3>{agent.name}</h3>
                         <span className={`status-badge ${agent.status}`}>{agent.status}</span>
@@ -1202,17 +1024,6 @@ Keep responses concise (2-3 sentences max).`;
                         {agent.agentType && agent.agentType !== 'custom' && (
                           <p><strong>Type:</strong> {agent.agentType === 'trending' ? '📈 Trending Poster' : '💬 Hashtag Commenter'}</p>
                         )}
-                        <p>
-                          <strong>Heartbeat:</strong>{' '}
-                          {agentHeartbeat ? (
-                            <span style={{ color: 'var(--success)' }}>
-                              💓 Every {agentHeartbeat.interval_min} min
-                              {agentHeartbeat.last_check && ` (last: ${fmtTs(agentHeartbeat.last_check)})`}
-                            </span>
-                          ) : (
-                            <span style={{ color: 'var(--text-secondary)' }}>Off</span>
-                          )}
-                        </p>
                       </div>
                       <div className="agent-actions">
                         <button
@@ -1222,28 +1033,10 @@ Keep responses concise (2-3 sentences max).`;
                         >
                           {agent.status === 'running' ? '⏳ Running…' : '▶️ Run Agent'}
                         </button>
-                        {agentHeartbeat ? (
-                          <button
-                            className="check-btn"
-                            title="Disable heartbeat monitoring"
-                            onClick={() => disableHeartbeat(agentHeartbeat.id, agent.id)}
-                          >
-                            💔 Heartbeat
-                          </button>
-                        ) : (
-                          <button
-                            className="check-btn"
-                            title="Enable heartbeat monitoring (every 60 min)"
-                            onClick={() => enableHeartbeat(agent.id, 60)}
-                          >
-                            💓 Heartbeat
-                          </button>
-                        )}
                         <button className="delete-btn" onClick={() => deleteAgent(agent.id)}>🗑️</button>
                       </div>
-                    </div>
-                  );
-                })}
+                  </div>
+                ))}
               </div>
             )}
 
@@ -1263,203 +1056,6 @@ Keep responses concise (2-3 sentences max).`;
               </div>
             )}
 
-            {/* Heartbeat Monitor */}
-            <div style={{ marginTop: '32px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
-                <h3>💓 Heartbeat Monitor</h3>
-                <button className="check-btn" onClick={refreshHeartbeatRuns}>🔄 Refresh</button>
-              </div>
-              {heartbeatRuns.length === 0 ? (
-                <p style={{ color: 'var(--text-secondary)', fontSize: '13px' }}>
-                  No heartbeat checks recorded yet. Enable heartbeats on agents above to start monitoring.
-                </p>
-              ) : (
-                <div className="logs-list">
-                  {heartbeatRuns.slice(0, 30).map(r => (
-                    <div key={r.id} className={`log-entry ${r.status === 'ok' ? 'success' : r.status === 'idle' ? 'info' : 'error'}`}>
-                      <span className="log-time">{fmtTs(r.checked_at)}</span>
-                      <span className={`log-level ${r.status === 'ok' ? 'success' : 'info'}`}>[{r.status.toUpperCase()}]</span>
-                      <span className="log-message">Agent {r.agent_id.slice(-8)} – {r.message || 'No message'}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* EVENTS TAB */}
-        {activeTab === 'events' && (
-          <div className="agents-container">
-            <div className="agents-header">
-              <h2>⚡ Event Triggers</h2>
-              <div style={{ display: 'flex', gap: '8px' }}>
-                <button
-                  className="create-agent-btn"
-                  onClick={() => {
-                    if (agents.length > 0) setNewTriggerAgentId(agents[0].id);
-                    setShowEventTriggerForm(true);
-                  }}
-                  disabled={agents.length === 0}
-                >
-                  + New Trigger
-                </button>
-              </div>
-            </div>
-
-            <div className="setting-description" style={{ marginBottom: '16px' }}>
-              <p style={{ marginBottom: '8px' }}>
-                <strong>What is the Events tab?</strong> Event Triggers let your agents react automatically to things that happen on the web — no manual work required.
-              </p>
-              <ul style={{ margin: '0 0 4px 16px', fontSize: '13px', lineHeight: '1.6' }}>
-                <li><strong>Keyword found on page</strong> – runs an agent the moment a specific word or phrase appears on a URL you're watching.</li>
-                <li><strong>URL content changed</strong> – fires when any content on a page changes since the last check.</li>
-                <li><strong>New post / feed item detected</strong> – triggers on new items in a feed or listing page.</li>
-              </ul>
-              <p style={{ marginTop: '8px', fontSize: '13px', color: 'var(--text-secondary)' }}>
-                Triggers are polled every 60 seconds by the background scheduler. The <em>Event History</em> section below shows every time a trigger has fired and which agent was activated.
-              </p>
-            </div>
-
-            {agents.length === 0 && (
-              <div className="empty-state">
-                <p>Create at least one agent before adding event triggers.</p>
-              </div>
-            )}
-
-            {/* New Trigger Form */}
-            {showEventTriggerForm && (
-              <div className="agent-card" style={{ marginBottom: '24px', border: '1px dashed var(--accent)' }}>
-                <h3 style={{ marginBottom: '12px' }}>🔧 New Event Trigger</h3>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                  <div>
-                    <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Agent to trigger</label>
-                    <select
-                      value={newTriggerAgentId}
-                      onChange={e => setNewTriggerAgentId(e.target.value)}
-                      style={{ width: '100%', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '4px' }}
-                    >
-                      {agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Trigger type</label>
-                    <select
-                      value={newTriggerType}
-                      onChange={e => setNewTriggerType(e.target.value)}
-                      style={{ width: '100%', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '4px' }}
-                    >
-                      <option value="keyword_found">🔍 Keyword found on page</option>
-                      <option value="url_change">🔄 URL content changed</option>
-                      <option value="new_post">📰 New post / feed item detected</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Target URL (http:// only — TLS not supported in built-in poller)</label>
-                    <input
-                      type="url"
-                      value={newTriggerUrl}
-                      onChange={e => setNewTriggerUrl(e.target.value)}
-                      placeholder="http://example.com/feed"
-                      style={{ width: '100%', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: newTriggerUrl && !newTriggerUrl.startsWith('http://') ? '1px solid var(--error)' : '1px solid var(--border)', borderRadius: '4px', boxSizing: 'border-box' }}
-                    />
-                    {newTriggerUrl && !newTriggerUrl.startsWith('http://') && (
-                      <p style={{ fontSize: '11px', color: 'var(--error)', margin: '4px 0 0' }}>
-                        ⚠️ Only http:// URLs are supported. https:// requires TLS support not available in the built-in poller.
-                      </p>
-                    )}
-                  </div>
-                  {newTriggerType === 'keyword_found' && (
-                    <div>
-                      <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Keyword</label>
-                      <input
-                        type="text"
-                        value={newTriggerKeyword}
-                        onChange={e => setNewTriggerKeyword(e.target.value)}
-                        placeholder="e.g. openclaw"
-                        style={{ width: '100%', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '4px', boxSizing: 'border-box' }}
-                      />
-                    </div>
-                  )}
-                  <div>
-                    <label style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>Check interval (minutes)</label>
-                    <input
-                      type="number"
-                      min={5}
-                      max={1440}
-                      value={newTriggerInterval}
-                      onChange={e => setNewTriggerInterval(Number(e.target.value))}
-                      style={{ width: '120px', padding: '6px', marginTop: '4px', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '4px' }}
-                    />
-                  </div>
-                  <div style={{ display: 'flex', gap: '8px' }}>
-                    <button className="run-btn" onClick={createEventTrigger}>✅ Create Trigger</button>
-                    <button className="delete-btn" onClick={() => setShowEventTriggerForm(false)}>Cancel</button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Existing triggers list */}
-            {eventTriggers.length === 0 && !showEventTriggerForm ? (
-              <div className="empty-state">
-                <p>No event triggers yet.</p>
-                <p style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
-                  Click <strong>+ New Trigger</strong> to add one. Triggers are polled by the background scheduler.
-                </p>
-              </div>
-            ) : (
-              <div className="agents-grid">
-                {eventTriggers.map(t => {
-                  const agent = agents.find(a => a.id === t.agent_id);
-                  return (
-                    <div key={t.id} className="agent-card">
-                      <div className="agent-header">
-                        <h3 style={{ fontSize: '14px' }}>
-                          {t.trigger_type === 'keyword_found' ? '🔍' : t.trigger_type === 'url_change' ? '🔄' : '📰'}{' '}
-                          {t.trigger_type.replace(/_/g, ' ')}
-                        </h3>
-                        <span className={`status-badge ${t.enabled ? 'completed' : 'idle'}`}>
-                          {t.enabled ? 'enabled' : 'disabled'}
-                        </span>
-                      </div>
-                      <div className="agent-details">
-                        <p><strong>Agent:</strong> {agent?.name ?? t.agent_id.slice(-8)}</p>
-                        <p><strong>URL:</strong> <span style={{ wordBreak: 'break-all', fontSize: '12px' }}>{t.target_url}</span></p>
-                        {t.keyword && <p><strong>Keyword:</strong> {t.keyword}</p>}
-                        <p><strong>Interval:</strong> every {t.check_interval_min} min</p>
-                        {t.last_checked && <p><strong>Last checked:</strong> {fmtTs(t.last_checked)}</p>}
-                      </div>
-                      <div className="agent-actions">
-                        <button className="delete-btn" onClick={() => deleteEventTrigger(t.id)}>🗑️ Delete</button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* Event history */}
-            <div style={{ marginTop: '32px' }}>
-              <h3 style={{ marginBottom: '12px' }}>📋 Event History</h3>
-              {eventHistory.length === 0 ? (
-                <p style={{ color: 'var(--text-secondary)', fontSize: '13px' }}>
-                  No events fired yet. Triggers are polled every 60 seconds when the scheduler runs.
-                </p>
-              ) : (
-                <div className="logs-list">
-                  {eventHistory.slice(0, 30).map(e => (
-                    <div key={e.id} className={`log-entry ${e.status === 'fired' ? 'success' : 'error'}`}>
-                      <span className="log-time">{fmtTs(e.fired_at)}</span>
-                      <span className={`log-level ${e.status === 'fired' ? 'success' : 'error'}`}>[{e.status.toUpperCase()}]</span>
-                      <span className="log-message">
-                        Agent {e.agent_id.slice(-8)} – {e.matched_content?.slice(0, 120) || 'No details'}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
           </div>
         )}
 
@@ -1741,71 +1337,6 @@ Keep responses concise (2-3 sentences max).`;
         onCancel={handleCancel}
       />
 
-      {/* Floating mini-chat overlay (issue #16) – visible on all tabs except chat */}
-      {isFloatingChatOpen && (
-        <div className="floating-chat-overlay" style={{ zIndex: 10000 }}>
-          <div className="floating-chat-header">
-            <span>🤖 Quick Chat</span>
-            <button onClick={() => setIsFloatingChatOpen(false)} className="floating-close-btn">✕</button>
-          </div>
-          <div className="floating-chat-messages">
-            {messages.slice(-6).map((msg, idx) => (
-              <div key={idx} className={`floating-msg ${msg.role}`}>
-                <span className="floating-msg-avatar">{msg.role === 'user' ? '👤' : '🤖'}</span>
-                <span className="floating-msg-text">{msg.content.slice(0, 200)}{msg.content.length > 200 ? '…' : ''}</span>
-              </div>
-            ))}
-            <div ref={floatingMessagesEndRef} />
-          </div>
-          <div className="floating-chat-input">
-            <input
-              type="text"
-              value={floatingInput}
-              onChange={e => setFloatingInput(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && floatingInput.trim()) {
-                  const msg = floatingInput;
-                  setFloatingInput('');
-                  setIsFloatingChatOpen(false);
-                  setActiveTab('chat');
-                  handleSendMessage(msg);
-                }
-              }}
-              placeholder="Ask anything…"
-            />
-            <button
-              onClick={() => {
-                if (!floatingInput.trim()) return;
-                const msg = floatingInput;
-                setFloatingInput('');
-                setIsFloatingChatOpen(false);
-                setActiveTab('chat');
-                handleSendMessage(msg);
-              }}
-            >
-              →
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Floating Assistant Icon – visible on all tabs except chat */}
-      {activeTab !== 'chat' && (
-      <button
-        className={`floating-assistant-btn ${isChatOpen ? 'open' : ''}`}
-        title={isFloatingChatOpen ? 'Close mini chat' : 'Open mini chat'}
-        onClick={() => {
-          setIsFloatingChatOpen(prev => !prev);
-          if (!isFloatingChatOpen) {
-            setIsChatOpen(prev => !prev);
-          }
-        }}
-        aria-label="Toggle chat panel"
-        style={{ zIndex: 10001 }}
-      >
-        {isFloatingChatOpen ? '✕' : '🤖'}
-      </button>
-      )}
     </div>
   );
 }

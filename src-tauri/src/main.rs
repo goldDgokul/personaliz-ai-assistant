@@ -11,7 +11,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue, protocol::Message},
+};
 use uuid::Uuid;
 
 // ============================================================
@@ -1067,6 +1070,15 @@ fn to_ws_url(broker_url: &str) -> String {
     }
 }
 
+fn next_reconnect_delay_secs(current: u64) -> u64 {
+    match current {
+        0 | 1 => 2,
+        2 => 5,
+        5 => 10,
+        _ => 10,
+    }
+}
+
 fn run_remote_task(task: RemoteTask) -> Result<serde_json::Value, String> {
     if task.action != "run_agent" {
         return Err(format!("Unsupported task action: {}", task.action));
@@ -1132,6 +1144,7 @@ fn start_agent_connector() {
     let device_id = std::env::var("DEVICE_ID").unwrap_or_else(|_| "gokul-pc".to_string());
 
     tauri::async_runtime::spawn(async move {
+        let mut reconnect_delay_secs = 1_u64;
         loop {
             let base_ws = to_ws_url(&broker_url);
             let full_url = format!(
@@ -1140,29 +1153,47 @@ fn start_agent_connector() {
                 device_id
             );
 
-            let request = match http::Request::builder()
-                .uri(&full_url)
-                .header("X-AGENT-TOKEN", &agent_token)
-                .body(())
-            {
+            let mut request = match full_url.clone().into_client_request() {
                 Ok(r) => r,
                 Err(e) => {
-                    println!("[broker] Failed to build WS request: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    println!(
+                        "[broker] WS connect failed ({e}); retrying in {}s",
+                        reconnect_delay_secs
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(reconnect_delay_secs)).await;
+                    reconnect_delay_secs = next_reconnect_delay_secs(reconnect_delay_secs);
                     continue;
                 }
             };
 
-            let connection = connect_async(request).await;
-            let (mut ws, _) = match connection {
+            let token_value = match HeaderValue::from_str(&agent_token) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!(
+                        "[broker] WS connect failed (invalid AGENT_TOKEN header: {e}); retrying in {}s",
+                        reconnect_delay_secs
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(reconnect_delay_secs)).await;
+                    reconnect_delay_secs = next_reconnect_delay_secs(reconnect_delay_secs);
+                    continue;
+                }
+            };
+            request.headers_mut().insert("X-AGENT-TOKEN", token_value);
+
+            let (mut ws, _) = match connect_async(request).await {
                 Ok(tuple) => tuple,
                 Err(e) => {
-                    println!("[broker] Connect failed: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    println!(
+                        "[broker] WS connect failed ({e}); retrying in {}s",
+                        reconnect_delay_secs
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(reconnect_delay_secs)).await;
+                    reconnect_delay_secs = next_reconnect_delay_secs(reconnect_delay_secs);
                     continue;
                 }
             };
 
+            reconnect_delay_secs = 1;
             println!("[broker] Connected as {}", device_id);
             let _ = send_ws_json(
                 &mut ws,
@@ -1250,8 +1281,12 @@ fn start_agent_connector() {
                 }
             }
 
-            println!("[broker] Disconnected; retrying in 5s");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            println!(
+                "[broker] Disconnected; retrying in {}s",
+                reconnect_delay_secs
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(reconnect_delay_secs)).await;
+            reconnect_delay_secs = next_reconnect_delay_secs(reconnect_delay_secs);
         }
     });
 }

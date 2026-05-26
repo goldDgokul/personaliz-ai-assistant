@@ -79,6 +79,64 @@ The onboarding wizard guides you through the rest (LLM check, OpenClaw install, 
 
 ---
 
+## 🌐 Remote Control MVP (Option C: single main laptop agent)
+
+- Main laptop device id: `gokul-pc`
+- Broker service (Render): `personaliz-broker` (`broker/` FastAPI + WebSocket)
+- UI project (Vercel): `personaliz-ui`
+- Storage: in-memory (MVP)
+- Local Ollama endpoint stays private on laptop: `http://127.0.0.1:11434`
+
+### Local development
+
+1. Run broker:
+   ```bash
+   cd broker
+   python -m venv .venv
+   source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+   pip install -r requirements.txt
+   export USER_TOKEN=your_user_token
+   export AGENT_TOKEN=your_agent_token
+   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+   ```
+2. Run UI (browser mode):
+   ```bash
+   npm install
+   npm run dev
+   ```
+   Default broker URL is `http://localhost:8000` (override with `VITE_BROKER_URL`).
+3. Run laptop app (`tauri dev` for testing, built app for daily use) with:
+   - `BROKER_URL=http://localhost:8000`
+   - `AGENT_TOKEN=<same as broker>`
+   - `DEVICE_ID=gokul-pc` (optional; defaults to `gokul-pc`)
+
+### Production configuration
+
+- **Render (`personaliz-broker`) env vars**
+  - `AGENT_TOKEN=<secret>`
+  - `USER_TOKEN=<secret>`
+  - `CORS_ALLOWED_ORIGINS=https://<your-vercel-domain>`
+- **Vercel (`personaliz-ui`) env vars**
+  - `VITE_BROKER_URL=https://<your-render-service>.onrender.com`
+- **Laptop built app env vars**
+  - `BROKER_URL=https://<your-render-service>.onrender.com`
+  - `AGENT_TOKEN=<same AGENT_TOKEN>`
+  - `DEVICE_ID=gokul-pc`
+
+### Authentication model
+
+- Browser UI asks for `USER_TOKEN` at runtime and stores it in `localStorage` (`X-USER-TOKEN` for REST, token on client WS URL).
+- Laptop agent connector authenticates with `X-AGENT-TOKEN`.
+- Do **not** embed `USER_TOKEN` into build artifacts.
+
+### Windows auto-start (built app)
+
+1. Build app: `npm run tauri build`
+2. Press `Win + R`, run: `shell:startup`
+3. Place a shortcut to the built Personaliz `.exe` in this Startup folder.
+
+---
+
 ## 🧠 Local Model Management
 
 ### Ollama

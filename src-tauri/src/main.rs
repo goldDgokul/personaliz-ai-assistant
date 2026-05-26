@@ -1,12 +1,17 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 mod db;
 mod scheduler;
 
+use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
-use serde::{Deserialize, Serialize};
-use chrono::Utc;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use uuid::Uuid;
 
 // ============================================================
@@ -31,6 +36,36 @@ struct OllamaResponse {
     message: OllamaMessage,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct RemoteAgent {
+    id: String,
+    name: String,
+    #[serde(default)]
+    agentType: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct RemoteTaskPayload {
+    agent: RemoteAgent,
+    #[serde(default)]
+    sandbox: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct RemoteTask {
+    id: String,
+    action: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct RemoteEnvelope {
+    #[serde(rename = "type")]
+    message_type: String,
+    #[serde(default)]
+    task: Option<RemoteTask>,
+}
+
 // ============================================================
 // Helper: locate agent_engine.py relative to the Tauri binary
 // ============================================================
@@ -44,7 +79,11 @@ fn agent_engine_path() -> PathBuf {
 }
 
 fn python_cmd() -> &'static str {
-    if cfg!(target_os = "windows") { "python" } else { "python3" }
+    if cfg!(target_os = "windows") {
+        "python"
+    } else {
+        "python3"
+    }
 }
 
 // ============================================================
@@ -84,14 +123,18 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
                          automation without touching command line. Be concise and helpful.";
 
     let mut history = req.history;
-    history.push(OllamaMessage { role: "user".to_string(), content: req.message.clone() });
+    history.push(OllamaMessage {
+        role: "user".to_string(),
+        content: req.message.clone(),
+    });
 
     let is_google = req.model.starts_with("gemini") || req.model.starts_with("gemma");
     let response_text = if req.model.contains("claude") {
         // Anthropic Claude API
-        let messages: Vec<serde_json::Value> = history.iter().map(|m| {
-            serde_json::json!({"role": m.role, "content": m.content})
-        }).collect();
+        let messages: Vec<serde_json::Value> = history
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
 
         let body = serde_json::json!({
             "model": req.model,
@@ -111,10 +154,15 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
             .map_err(|e| format!("Anthropic request failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Anthropic API error: {}. Make sure you are using an Anthropic key (sk-ant-…).", resp.status()));
+            return Err(format!(
+                "Anthropic API error: {}. Make sure you are using an Anthropic key (sk-ant-…).",
+                resp.status()
+            ));
         }
 
-        let data: serde_json::Value = resp.json().await
+        let data: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| format!("Failed to parse Anthropic response: {e}"))?;
         data["content"][0]["text"]
             .as_str()
@@ -128,13 +176,20 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
         );
 
         // Build conversation contents; Gemini uses "user"/"model" roles
-        let contents: Vec<serde_json::Value> = history.iter().map(|m| {
-            let role = if m.role == "assistant" { "model" } else { "user" };
-            serde_json::json!({
-                "role": role,
-                "parts": [{"text": m.content}]
+        let contents: Vec<serde_json::Value> = history
+            .iter()
+            .map(|m| {
+                let role = if m.role == "assistant" {
+                    "model"
+                } else {
+                    "user"
+                };
+                serde_json::json!({
+                    "role": role,
+                    "parts": [{"text": m.content}]
+                })
             })
-        }).collect();
+            .collect();
 
         let body = serde_json::json!({
             "contents": contents,
@@ -167,7 +222,9 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
             return Err(format!("Google AI API error: {}{}", status, hint));
         }
 
-        let data: serde_json::Value = resp.json().await
+        let data: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| format!("Failed to parse Google AI response: {e}"))?;
         data["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
@@ -175,11 +232,14 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
             .to_string()
     } else {
         // OpenAI-compatible API
-        let messages: Vec<serde_json::Value> = std::iter::once(
-            serde_json::json!({"role": "system", "content": system_prompt})
-        ).chain(history.iter().map(|m| {
-            serde_json::json!({"role": m.role, "content": m.content})
-        })).collect();
+        let messages: Vec<serde_json::Value> =
+            std::iter::once(serde_json::json!({"role": "system", "content": system_prompt}))
+                .chain(
+                    history
+                        .iter()
+                        .map(|m| serde_json::json!({"role": m.role, "content": m.content})),
+                )
+                .collect();
 
         let body = serde_json::json!({
             "model": req.model,
@@ -207,7 +267,9 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
             return Err(format!("OpenAI API error: {}{}", status, hint));
         }
 
-        let data: serde_json::Value = resp.json().await
+        let data: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| format!("Failed to parse OpenAI response: {e}"))?;
         data["choices"][0]["message"]["content"]
             .as_str()
@@ -216,9 +278,13 @@ async fn send_message_to_external_llm(req: ExternalLlmRequest) -> Result<String,
     };
 
     // Log LLM usage to SQLite
-    let provider = if req.model.contains("claude") { "anthropic" }
-                   else if is_google { "google" }
-                   else { "openai" };
+    let provider = if req.model.contains("claude") {
+        "anthropic"
+    } else if is_google {
+        "google"
+    } else {
+        "openai"
+    };
     let ctx = req.context.unwrap_or_default();
     let _ = db::record_llm_usage(provider, &req.model, &ctx, &Utc::now().to_rfc3339());
 
@@ -265,7 +331,9 @@ fn check_ollama_status() -> bool {
         .to_socket_addrs()
         .ok()
         .and_then(|mut a| a.next())
-        .and_then(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok())
+        .and_then(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()
+        })
         .is_some()
 }
 
@@ -282,7 +350,8 @@ async fn send_message_to_llm(
     let selected_model = model.unwrap_or_else(|| "llama3".to_string());
 
     let client = reqwest::Client::new();
-    let system_content = "You are Personaliz Desktop Assistant. You help users set up OpenClaw automation \
+    let system_content =
+        "You are Personaliz Desktop Assistant. You help users set up OpenClaw automation \
                   without touching command line. Be concise and helpful.";
 
     let mut messages = vec![OllamaMessage {
@@ -310,7 +379,10 @@ async fn send_message_to_llm(
     let llamacpp_available = tcp_check("127.0.0.1:8080");
 
     if !ollama_available && !llamacpp_available {
-        return Err("No local LLM found. Start Ollama (ollama serve) or llama-server on port 8080.".to_string());
+        return Err(
+            "No local LLM found. Start Ollama (ollama serve) or llama-server on port 8080."
+                .to_string(),
+        );
     }
 
     let ctx = context.unwrap_or_default();
@@ -331,7 +403,12 @@ async fn send_message_to_llm(
             Ok(response) if response.status().is_success() => {
                 match response.json::<OllamaResponse>().await {
                     Ok(r) => {
-                        let _ = db::record_llm_usage("ollama", &selected_model, &ctx, &Utc::now().to_rfc3339());
+                        let _ = db::record_llm_usage(
+                            "ollama",
+                            &selected_model,
+                            &ctx,
+                            &Utc::now().to_rfc3339(),
+                        );
                         return Ok(r.message.content);
                     }
                     Err(e) => return Err(format!("Failed to parse Ollama response: {e}")),
@@ -343,9 +420,10 @@ async fn send_message_to_llm(
     }
 
     // Fallback: llama.cpp server (OpenAI-compatible API on port 8080)
-    let oai_messages: Vec<serde_json::Value> = messages.iter().map(|m| {
-        serde_json::json!({"role": m.role, "content": m.content})
-    }).collect();
+    let oai_messages: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+        .collect();
 
     let body = serde_json::json!({
         "model": selected_model,
@@ -362,10 +440,15 @@ async fn send_message_to_llm(
         .map_err(|e| format!("Failed to connect to llama.cpp server: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("llama.cpp server returned error: {}", resp.status()));
+        return Err(format!(
+            "llama.cpp server returned error: {}",
+            resp.status()
+        ));
     }
 
-    let data: serde_json::Value = resp.json().await
+    let data: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse llama.cpp response: {e}"))?;
     let reply = data["choices"][0]["message"]["content"]
         .as_str()
@@ -426,7 +509,10 @@ fn run_python_agent(
     agent_name: String,
     sandbox: bool,
 ) -> Result<serde_json::Value, String> {
-    println!("Running Python agent: {} (sandbox: {})", agent_name, sandbox);
+    println!(
+        "Running Python agent: {} (sandbox: {})",
+        agent_name, sandbox
+    );
 
     let agent_path = agent_engine_path();
     if !agent_path.exists() {
@@ -528,9 +614,8 @@ fn comment_linkedin_hashtag(
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        serde_json::from_str::<serde_json::Value>(&stdout).map_err(|e| {
-            format!("Failed to parse hashtag agent output: {e}\nOutput: {stdout}")
-        })
+        serde_json::from_str::<serde_json::Value>(&stdout)
+            .map_err(|e| format!("Failed to parse hashtag agent output: {e}\nOutput: {stdout}"))
     } else {
         Err(format!(
             "Hashtag comment agent failed: {}",
@@ -545,7 +630,11 @@ fn comment_linkedin_hashtag(
 
 #[tauri::command]
 fn check_openclaw_installed() -> bool {
-    let cmd = if cfg!(target_os = "windows") { "where" } else { "which" };
+    let cmd = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
     Command::new(cmd)
         .arg("openclaw")
         .output()
@@ -594,10 +683,7 @@ fn install_openclaw() -> Result<String, String> {
 /// Captures stdout/stderr and stores them in the `openclaw_runs` table.
 /// Returns a JSON object with status, stdout, stderr.
 #[tauri::command]
-fn run_openclaw_agent(
-    agent_id: String,
-    config_path: String,
-) -> Result<serde_json::Value, String> {
+fn run_openclaw_agent(agent_id: String, config_path: String) -> Result<serde_json::Value, String> {
     let started_at = Utc::now().to_rfc3339();
     let command_str = format!("openclaw run \"{}\"", config_path);
 
@@ -616,7 +702,12 @@ fn run_openclaw_agent(
             &started_at,
             &finished_at,
         );
-        let _ = db::append_log(&agent_id, "warning", &format!("[openclaw] {stderr}"), &finished_at);
+        let _ = db::append_log(
+            &agent_id,
+            "warning",
+            &format!("[openclaw] {stderr}"),
+            &finished_at,
+        );
         return Ok(serde_json::json!({
             "status": "skipped",
             "reason": "openclaw_missing",
@@ -657,9 +748,16 @@ fn run_openclaw_agent(
             // Also append to logs table
             let level = if success { "success" } else { "error" };
             let log_msg = if success {
-                format!("[openclaw] run succeeded: {}", stdout.lines().next().unwrap_or("ok"))
+                format!(
+                    "[openclaw] run succeeded: {}",
+                    stdout.lines().next().unwrap_or("ok")
+                )
             } else {
-                format!("[openclaw] run failed (exit {:?}): {}", exit_code, stderr.lines().next().unwrap_or(""))
+                format!(
+                    "[openclaw] run failed (exit {:?}): {}",
+                    exit_code,
+                    stderr.lines().next().unwrap_or("")
+                )
             };
             let _ = db::append_log(&agent_id, level, &log_msg, &finished_at);
 
@@ -675,10 +773,21 @@ fn run_openclaw_agent(
         Err(e) => {
             let stderr = format!("Failed to run openclaw: {e}. Make sure openclaw is installed (npm install -g openclaw).");
             let _ = db::record_openclaw_run(
-                &agent_id, &config_path, &command_str, "", &stderr,
-                Some(-1), &started_at, &finished_at,
+                &agent_id,
+                &config_path,
+                &command_str,
+                "",
+                &stderr,
+                Some(-1),
+                &started_at,
+                &finished_at,
             );
-            let _ = db::append_log(&agent_id, "error", &format!("[openclaw] {stderr}"), &finished_at);
+            let _ = db::append_log(
+                &agent_id,
+                "error",
+                &format!("[openclaw] {stderr}"),
+                &finished_at,
+            );
             Err(stderr)
         }
     }
@@ -690,8 +799,7 @@ fn db_get_openclaw_runs(
     agent_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<db::OpenClawRunRow>, String> {
-    db::get_openclaw_runs(agent_id.as_deref(), limit.unwrap_or(100))
-        .map_err(|e| e.to_string())
+    db::get_openclaw_runs(agent_id.as_deref(), limit.unwrap_or(100)).map_err(|e| e.to_string())
 }
 
 // ============================================================
@@ -760,11 +868,8 @@ fn db_upsert_schedule(
 ) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let next_run = scheduler::compute_next_run_from_schedule(
-        &frequency,
-        cron_expression.as_deref(),
-        &now,
-    );
+    let next_run =
+        scheduler::compute_next_run_from_schedule(&frequency, cron_expression.as_deref(), &now);
     let row = db::ScheduleRow {
         id: id.clone(),
         agent_id,
@@ -794,19 +899,14 @@ fn db_delete_schedule(id: String) -> Result<(), String> {
 // ============================================================
 
 #[tauri::command]
-fn db_append_log(
-    agent_id: String,
-    level: String,
-    message: String,
-) -> Result<i64, String> {
+fn db_append_log(agent_id: String, level: String, message: String) -> Result<i64, String> {
     let ts = Utc::now().to_rfc3339();
     db::append_log(&agent_id, &level, &message, &ts).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn db_get_logs(agent_id: Option<String>, limit: Option<usize>) -> Result<Vec<db::LogRow>, String> {
-    db::get_logs(agent_id.as_deref(), limit.unwrap_or(200))
-        .map_err(|e| e.to_string())
+    db::get_logs(agent_id.as_deref(), limit.unwrap_or(200)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -823,8 +923,7 @@ fn db_get_run_history(
     agent_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<db::RunHistoryRow>, String> {
-    db::get_run_history(agent_id.as_deref(), limit.unwrap_or(100))
-        .map_err(|e| e.to_string())
+    db::get_run_history(agent_id.as_deref(), limit.unwrap_or(100)).map_err(|e| e.to_string())
 }
 
 // ============================================================
@@ -839,8 +938,14 @@ fn db_record_approval(
     notes: Option<String>,
 ) -> Result<i64, String> {
     let decided_at = Utc::now().to_rfc3339();
-    db::record_approval(&agent_id, &content_preview, &outcome, &decided_at, notes.as_deref())
-        .map_err(|e| e.to_string())
+    db::record_approval(
+        &agent_id,
+        &content_preview,
+        &outcome,
+        &decided_at,
+        notes.as_deref(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -848,8 +953,7 @@ fn db_list_approvals(
     agent_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<db::ApprovalRow>, String> {
-    db::list_approvals(agent_id.as_deref(), limit.unwrap_or(100))
-        .map_err(|e| e.to_string())
+    db::list_approvals(agent_id.as_deref(), limit.unwrap_or(100)).map_err(|e| e.to_string())
 }
 
 // ============================================================
@@ -862,7 +966,9 @@ fn validate_cron_expression(cron: String) -> Result<String, String> {
     let now = Utc::now();
     match scheduler::next_cron_time(&cron, &now) {
         Some(next) => Ok(next.to_rfc3339()),
-        None => Err(format!("Invalid cron expression: '{cron}'. Expected 5 fields: minute hour day month weekday")),
+        None => Err(format!(
+            "Invalid cron expression: '{cron}'. Expected 5 fields: minute hour day month weekday"
+        )),
     }
 }
 
@@ -880,7 +986,9 @@ fn check_llamacpp_status() -> bool {
         .to_socket_addrs()
         .ok()
         .and_then(|mut a| a.next())
-        .and_then(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok())
+        .and_then(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()
+        })
         .is_some()
 }
 
@@ -913,8 +1021,7 @@ fn create_openclaw_config(
         }
     };
 
-    fs::create_dir_all(&dir_path)
-        .map_err(|e| format!("Cannot create config directory: {e}"))?;
+    fs::create_dir_all(&dir_path).map_err(|e| format!("Cannot create config directory: {e}"))?;
 
     let config = serde_json::json!({
         "id": agent_id,
@@ -950,6 +1057,205 @@ fn dirs_or_home() -> std::path::PathBuf {
     }
 }
 
+fn to_ws_url(broker_url: &str) -> String {
+    if broker_url.starts_with("https://") {
+        broker_url.replacen("https://", "wss://", 1)
+    } else if broker_url.starts_with("http://") {
+        broker_url.replacen("http://", "ws://", 1)
+    } else {
+        broker_url.to_string()
+    }
+}
+
+fn run_remote_task(task: RemoteTask) -> Result<serde_json::Value, String> {
+    if task.action != "run_agent" {
+        return Err(format!("Unsupported task action: {}", task.action));
+    }
+
+    let payload: RemoteTaskPayload =
+        serde_json::from_value(task.payload).map_err(|e| format!("Invalid task payload: {e}"))?;
+    let sandbox = payload.sandbox.unwrap_or(true);
+    let agent_id = payload.agent.id.clone();
+
+    if payload.agent.agentType.as_deref() == Some("hashtag") {
+        let default_comment = "🎯 Check out Personaliz – it makes OpenClaw automation accessible to everyone, no coding needed! https://github.com/goldDgokul/personaliz-ai-assistant #OpenClaw #Automation".to_string();
+        let hashtag = comment_linkedin_hashtag("openclaw".to_string(), default_comment, sandbox)?;
+        Ok(serde_json::json!({
+            "agent_id": agent_id,
+            "status": "success",
+            "result": hashtag,
+        }))
+    } else {
+        let py = run_python_agent(
+            payload.agent.id.clone(),
+            payload.agent.name.clone(),
+            sandbox,
+        )?;
+        if py.get("status").and_then(|v| v.as_str()) == Some("error") {
+            return Err(py
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Remote python agent failed")
+                .to_string());
+        }
+        Ok(serde_json::json!({
+            "agent_id": agent_id,
+            "status": py.get("status").cloned().unwrap_or(serde_json::json!("success")),
+            "result": py,
+        }))
+    }
+}
+
+async fn send_ws_json(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    ws.send(Message::Text(value.to_string()))
+        .await
+        .map_err(|e| format!("WS send failed: {e}"))
+}
+
+fn start_agent_connector() {
+    let broker_url = std::env::var("BROKER_URL").ok();
+    let agent_token = std::env::var("AGENT_TOKEN").ok();
+    if broker_url.as_deref().unwrap_or("").trim().is_empty()
+        || agent_token.as_deref().unwrap_or("").trim().is_empty()
+    {
+        println!("[broker] BROKER_URL or AGENT_TOKEN missing; remote connector disabled");
+        return;
+    }
+
+    let broker_url = broker_url.unwrap();
+    let agent_token = agent_token.unwrap();
+    let device_id = std::env::var("DEVICE_ID").unwrap_or_else(|_| "gokul-pc".to_string());
+
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let base_ws = to_ws_url(&broker_url);
+            let full_url = format!(
+                "{}/ws/agent?device_id={}",
+                base_ws.trim_end_matches('/'),
+                device_id
+            );
+
+            let request = match http::Request::builder()
+                .uri(&full_url)
+                .header("X-AGENT-TOKEN", &agent_token)
+                .body(())
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("[broker] Failed to build WS request: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let connection = connect_async(request).await;
+            let (mut ws, _) = match connection {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    println!("[broker] Connect failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            println!("[broker] Connected as {}", device_id);
+            let _ = send_ws_json(
+                &mut ws,
+                serde_json::json!({"type":"agent.register","device_id":device_id}),
+            )
+            .await;
+
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
+
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        if send_ws_json(&mut ws, serde_json::json!({"type":"heartbeat"})).await.is_err() {
+                            break;
+                        }
+                    }
+                    incoming = ws.next() => {
+                        match incoming {
+                            Some(Ok(Message::Text(text))) => {
+                                let parsed = serde_json::from_str::<RemoteEnvelope>(&text);
+                                if let Ok(envelope) = parsed {
+                                    if envelope.message_type == "task.created" {
+                                        if let Some(task) = envelope.task {
+                                            let task_id = task.id.clone();
+                                            let _ = send_ws_json(&mut ws, serde_json::json!({
+                                                "type":"task.start",
+                                                "task_id": task_id,
+                                            })).await;
+
+                                            let action_name = task.action.clone();
+                                            let run = tokio::task::spawn_blocking(move || run_remote_task(task)).await;
+                                            match run {
+                                                Ok(Ok(result)) => {
+                                                    if let Some(logs) = result.get("result").and_then(|r| r.get("logs")).and_then(|l| l.as_array()) {
+                                                        for entry in logs {
+                                                            let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+                                                            let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("log");
+                                                            let _ = send_ws_json(&mut ws, serde_json::json!({
+                                                                "type":"task.log",
+                                                                "task_id": task_id,
+                                                                "level": level,
+                                                                "message": message,
+                                                            })).await;
+                                                        }
+                                                    }
+                                                    let _ = send_ws_json(&mut ws, serde_json::json!({
+                                                        "type":"task.log",
+                                                        "task_id": task_id,
+                                                        "level":"info",
+                                                        "message": format!("Completed action {}", action_name),
+                                                        "result": result.clone(),
+                                                    })).await;
+                                                    let _ = send_ws_json(&mut ws, serde_json::json!({
+                                                        "type":"task.done",
+                                                        "task_id": task_id,
+                                                        "success": true,
+                                                        "result": result,
+                                                    })).await;
+                                                }
+                                                Ok(Err(err)) => {
+                                                    let _ = send_ws_json(&mut ws, serde_json::json!({
+                                                        "type":"task.done",
+                                                        "task_id": task_id,
+                                                        "success": false,
+                                                        "error": err,
+                                                    })).await;
+                                                }
+                                                Err(err) => {
+                                                    let _ = send_ws_json(&mut ws, serde_json::json!({
+                                                        "type":"task.done",
+                                                        "task_id": task_id,
+                                                        "success": false,
+                                                        "error": format!("Task thread failed: {}", err),
+                                                    })).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            println!("[broker] Disconnected; retrying in 5s");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+}
+
 // ============================================================
 // main
 // ============================================================
@@ -965,6 +1271,8 @@ fn main() {
         .setup(move |_app| {
             // Start background scheduler
             scheduler::start(engine_path.clone());
+            // Optional remote broker connector (disabled unless env vars are set)
+            start_agent_connector();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

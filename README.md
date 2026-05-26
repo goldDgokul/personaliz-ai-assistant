@@ -110,6 +110,15 @@ The onboarding wizard guides you through the rest (LLM check, OpenClaw install, 
    - `AGENT_TOKEN=<same as broker>`
    - `DEVICE_ID=gokul-pc` (optional; defaults to `gokul-pc`)
 
+### Troubleshooting (remote mode)
+
+- **`Port 1420 is already in use` when running `npm run tauri dev`**
+  - Another Vite/Tauri dev server is already running.
+  - Stop it (Windows example): `netstat -ano | findstr :1420` then `taskkill /PID <PID> /F`, then re-run `npm run tauri dev`.
+- **Device stays offline in browser UI**
+  - The laptop connector must complete the broker WebSocket handshake (`/ws/agent`) successfully with `X-AGENT-TOKEN`.
+  - If handshake fails, the connector keeps retrying and the device remains offline until a successful WS connection is established.
+
 ### Production configuration
 
 - **Render (`personaliz-broker`) env vars**

@@ -3,6 +3,13 @@ import { invoke } from '@tauri-apps/api/core';
 import AgentCreationModal from './components/AgentCreationModal';
 import { ApprovalModal } from './components/ApprovalModal';
 import Onboarding from './components/Onboarding';
+import {
+  USER_TOKEN_KEY,
+  connectBrokerClientSocket,
+  createBrokerTask,
+  isTauriRuntime,
+  listBrokerDevices,
+} from './services/brokerTransport';
 import './App.css';
 
 // ---------------------------------------------------------------------------
@@ -76,11 +83,14 @@ interface OpenClawRunRow {
   finished_at: string | null;
 }
 
+const REMOTE_DEVICE_ID = 'gokul-pc';
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
 function App() {
+  const isTauriApp = isTauriRuntime();
   const [activeTab, setActiveTab] = useState('chat');
   const [agents, setAgents] = useState<Agent[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -100,6 +110,10 @@ function App() {
     name: string; role: string; goal: string; tools: string[]; schedule: string; sandbox: boolean;
   } | null>(null);
   const [openClawRuns, setOpenClawRuns] = useState<OpenClawRunRow[]>([]);
+  const [userToken, setUserToken] = useState(() => localStorage.getItem(USER_TOKEN_KEY) || '');
+  const [tokenInput, setTokenInput] = useState('');
+  const [remoteDeviceOnline, setRemoteDeviceOnline] = useState(false);
+  const [remoteSocketConnected, setRemoteSocketConnected] = useState(false);
 
   // Approval modal
   const [showApprovalModal, setShowApprovalModal] = useState(false);
@@ -107,12 +121,20 @@ function App() {
   const [pendingAgentId, setPendingAgentId] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const pushLogEntry = (entry: LogEntry) => {
+    setLogs(prev => [entry, ...prev].slice(0, 200));
+  };
 
   // -------------------------------------------------------------------------
   // Init
   // -------------------------------------------------------------------------
 
   useEffect(() => {
+    if (!isTauriApp) {
+      setIsOnboarding(false);
+      return;
+    }
+
     const setupDone = localStorage.getItem('setup_completed');
     if (!setupDone) {
       setIsOnboarding(true);
@@ -122,11 +144,83 @@ function App() {
       setLocalModel(localStorage.getItem('local_model') || 'llama3');
       loadPersistedData();
     }
-  }, []);
+  }, [isTauriApp]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    if (isTauriApp || !userToken) return;
+
+    listBrokerDevices(userToken)
+      .then(devices => {
+        const device = devices.find(d => d.device_id === REMOTE_DEVICE_ID);
+        setRemoteDeviceOnline(!!device?.online);
+      })
+      .catch(() => setRemoteDeviceOnline(false));
+
+    const disconnect = connectBrokerClientSocket(
+      userToken,
+      (event) => {
+        if (event.type === 'snapshot') {
+          const device = (event.devices || []).find((d: any) => d.device_id === REMOTE_DEVICE_ID);
+          setRemoteDeviceOnline(!!device?.online);
+          return;
+        }
+
+        if (event.type === 'device.online' && event.device_id === REMOTE_DEVICE_ID) {
+          setRemoteDeviceOnline(true);
+          return;
+        }
+
+        if (event.type === 'device.offline' && event.device_id === REMOTE_DEVICE_ID) {
+          setRemoteDeviceOnline(false);
+          return;
+        }
+
+        const task = event.task || {};
+        const payload = task.payload || {};
+        const remoteAgentId = payload.agent?.id || event.result?.agent_id;
+        if (!remoteAgentId) return;
+
+        if (event.type === 'task.start') {
+          setAgents(prev => prev.map(a => a.id === remoteAgentId ? { ...a, status: 'running' } : a));
+          pushLogEntry({
+            timestamp: new Date().toISOString(),
+            agentId: remoteAgentId,
+            level: 'info',
+            message: '📡 Remote agent started task',
+          });
+          return;
+        }
+
+        if (event.type === 'task.log' && event.message) {
+          pushLogEntry({
+            timestamp: new Date().toISOString(),
+            agentId: remoteAgentId,
+            level: event.level || 'info',
+            message: String(event.message),
+          });
+          return;
+        }
+
+        if (event.type === 'task.done') {
+          const success = event.success !== false;
+          setAgents(prev => prev.map(a => a.id === remoteAgentId ? { ...a, status: success ? 'completed' : 'idle' } : a));
+          pushLogEntry({
+            timestamp: new Date().toISOString(),
+            agentId: remoteAgentId,
+            level: success ? 'success' : 'error',
+            message: success ? '✅ Remote task completed' : `❌ Remote task failed: ${event.error || 'Unknown error'}`,
+          });
+        }
+      },
+      setRemoteSocketConnected,
+    );
+
+    return disconnect;
+  }, [isTauriApp, userToken]);
 
   // -------------------------------------------------------------------------
   // Persistence helpers
@@ -534,7 +628,7 @@ Keep responses concise (2-3 sentences max).`;
       level,
       message,
     };
-    setLogs(prev => [entry, ...prev].slice(0, 200));
+    pushLogEntry(entry);
     persistLog(entry);
   };
 
@@ -662,6 +756,38 @@ Keep responses concise (2-3 sentences max).`;
     if (!agent) return;
 
     const modeText = sandboxMode ? '[SANDBOX]' : '[PRODUCTION]';
+
+    if (!isTauriApp) {
+      if (!userToken) {
+        addLog(agentId, 'error', 'Missing browser access token. Open Settings and set it.');
+        return;
+      }
+      if (!remoteDeviceOnline) {
+        addLog(agentId, 'warning', `${REMOTE_DEVICE_ID} is offline. Start the laptop agent first.`);
+        return;
+      }
+
+      addLog(agentId, 'info', `🚀 Sending remote task to ${REMOTE_DEVICE_ID} ${modeText}…`);
+      setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'running' } : a));
+
+      try {
+        const taskId = await createBrokerTask(userToken, {
+          device_id: REMOTE_DEVICE_ID,
+          action: 'run_agent',
+          payload: {
+            agent,
+            sandbox: sandboxMode,
+          },
+        });
+        addLog(agentId, 'info', `📨 Task queued (${taskId.slice(0, 8)})`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        addLog(agentId, 'error', `Failed to queue remote task: ${msg}`);
+        setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'idle' } : a));
+      }
+      return;
+    }
+
     addLog(agentId, 'info', `🚀 Running ${agent.name} ${modeText}…`);
     setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'running' } : a));
 
@@ -875,6 +1001,36 @@ Keep responses concise (2-3 sentences max).`;
   // Onboarding
   // -------------------------------------------------------------------------
 
+  if (!isTauriApp && !userToken) {
+    return (
+      <div className="token-gate">
+        <div className="token-gate-card">
+          <h2>Enter Access Token</h2>
+          <p>Provide your USER token to connect to the remote broker.</p>
+          <input
+            type="password"
+            value={tokenInput}
+            onChange={e => setTokenInput(e.target.value)}
+            placeholder="USER_TOKEN"
+          />
+          <button
+            className="send-btn"
+            onClick={() => {
+              const token = tokenInput.trim();
+              if (!token) return;
+              localStorage.setItem(USER_TOKEN_KEY, token);
+              setUserToken(token);
+              setTokenInput('');
+            }}
+            disabled={!tokenInput.trim()}
+          >
+            Save Token
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (isOnboarding) {
     return (
       <Onboarding onComplete={() => {
@@ -916,10 +1072,22 @@ Keep responses concise (2-3 sentences max).`;
         </nav>
 
         <div className="sidebar-footer">
-          <div className="status-badge" title={`Ollama: ${ollamaStatus}`}>
-            <span className={`status-dot ${ollamaStatus === 'connected' ? 'connected' : 'disconnected'}`} />
-            {ollamaStatus === 'connected' ? `${localModel} Ready` : 'Offline Mode'}
-          </div>
+          {isTauriApp ? (
+            <div className="status-badge" title={`Ollama: ${ollamaStatus}`}>
+              <span className={`status-dot ${ollamaStatus === 'connected' ? 'connected' : 'disconnected'}`} />
+              {ollamaStatus === 'connected' ? `${localModel} Ready` : 'Offline Mode'}
+            </div>
+          ) : (
+            <div className="status-badge" title={`${REMOTE_DEVICE_ID}: ${remoteDeviceOnline ? 'online' : 'offline'}`}>
+              <span className={`status-dot ${remoteDeviceOnline ? 'connected' : 'disconnected'}`} />
+              {REMOTE_DEVICE_ID} {remoteDeviceOnline ? 'online' : 'offline'}
+            </div>
+          )}
+          {!isTauriApp && (
+            <div className="status-badge" title="Broker websocket status">
+              {remoteSocketConnected ? '🌐 Broker Connected' : '🌐 Broker Disconnected'}
+            </div>
+          )}
           {useExternalLLM && (
             <div className="status-badge" title="Using external API">🔑 API Active</div>
           )}
@@ -1171,6 +1339,52 @@ Keep responses concise (2-3 sentences max).`;
         {activeTab === 'settings' && (
           <div className="settings-container">
             <h2>Settings</h2>
+
+            {!isTauriApp && (
+              <div className="settings-section">
+                <h3>Remote Access Token</h3>
+                <p className="setting-description">
+                  Browser mode uses a runtime token from localStorage. It is not bundled into the app build.
+                </p>
+                <div className="api-key-input">
+                  <label>Current token</label>
+                  <input type="password" value={userToken} readOnly />
+                </div>
+                <div className="api-key-input">
+                  <label>Update token</label>
+                  <input
+                    type="password"
+                    value={tokenInput}
+                    onChange={e => setTokenInput(e.target.value)}
+                    placeholder="Paste new USER_TOKEN"
+                  />
+                </div>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  <button
+                    className="check-btn"
+                    onClick={() => {
+                      const token = tokenInput.trim();
+                      if (!token) return;
+                      localStorage.setItem(USER_TOKEN_KEY, token);
+                      setUserToken(token);
+                      setTokenInput('');
+                    }}
+                  >
+                    Save Token
+                  </button>
+                  <button
+                    className="reset-btn"
+                    onClick={() => {
+                      localStorage.removeItem(USER_TOKEN_KEY);
+                      setUserToken('');
+                      setTokenInput('');
+                    }}
+                  >
+                    Clear Token
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Sandbox Mode */}
             <div className="settings-section">

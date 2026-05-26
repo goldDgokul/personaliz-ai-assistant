@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: personaliz-broker
+    runtime: python
+    rootDir: broker
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: USER_TOKEN
+        sync: false
+      - key: AGENT_TOKEN
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false

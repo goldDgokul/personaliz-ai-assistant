@@ -15,7 +15,7 @@ export const isTauriRuntime = (): boolean =>
   typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 export const getBrokerUrl = (): string =>
-  (import.meta.env.VITE_BROKER_URL as string | undefined)?.trim() || 'http://localhost:8000';
+  (import.meta.env.VITE_BROKER_URL as string | undefined)?.trim() || 'https://personaliz-broker.onrender.com';
 
 export const toWsUrl = (httpUrl: string): string => {
   if (httpUrl.startsWith('https://')) return httpUrl.replace('https://', 'wss://');

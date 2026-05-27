@@ -398,12 +398,13 @@ async fn send_message_to_llm(
         };
 
         match client
-            .post("http://localhost:11434/api/chat")
+            .post("http://127.0.0.1:11434/api/chat")
             .json(&request_body)
             .send()
             .await
         {
             Ok(response) if response.status().is_success() => {
+                println!("Received successful response from Ollama");
                 match response.json::<OllamaResponse>().await {
                     Ok(r) => {
                         let _ = db::record_llm_usage(

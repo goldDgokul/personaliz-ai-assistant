@@ -121,6 +121,7 @@ function App() {
   const [pendingAgentId, setPendingAgentId] = useState<string | null>(null);
 
   const pendingChatTasks = useRef<Record<string, {resolve: (msg: string) => void, reject: (err: any) => void}>>({});
+  const completedTasks = useRef<Record<string, any>>({});
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const pushLogEntry = (entry: LogEntry) => {
@@ -209,14 +210,17 @@ function App() {
 
         if (event.type === 'task.done') {
           const taskId = event.task_id || (event.task && event.task.id);
-          if (taskId && pendingChatTasks.current[taskId]) {
-            if (event.success === false) {
-              pendingChatTasks.current[taskId].reject(new Error(event.error || 'Remote chat failed'));
-            } else {
-              pendingChatTasks.current[taskId].resolve(event.result?.reply || 'No response');
+          if (taskId) {
+            completedTasks.current[taskId] = event;
+            if (pendingChatTasks.current[taskId]) {
+              if (event.success === false) {
+                pendingChatTasks.current[taskId].reject(new Error(event.error || 'Remote chat failed'));
+              } else {
+                pendingChatTasks.current[taskId].resolve(event.result?.reply || 'No response');
+              }
+              delete pendingChatTasks.current[taskId];
+              return;
             }
-            delete pendingChatTasks.current[taskId];
-            return;
           }
 
           const success = event.success !== false;
@@ -345,6 +349,12 @@ function App() {
         if (status) { setOllamaStatus('connected'); return; }
       } catch (_) {}
 
+      // If remote, assume connected if remote socket is alive (we don't have a direct ping task yet)
+      if (!isTauriApp && remoteSocketConnected) {
+        setOllamaStatus('connected');
+        return;
+      }
+
       const response = await fetch('http://localhost:11434/api/tags');
       setOllamaStatus(response.ok ? 'connected' : 'disconnected');
     } catch {
@@ -370,7 +380,13 @@ Keep responses concise (2-3 sentences max).`;
               model
             }
           });
-          pendingChatTasks.current[taskId] = { resolve, reject };
+          const completed = completedTasks.current[taskId];
+          if (completed) {
+            if (completed.success === false) reject(new Error(completed.error || 'Remote chat failed'));
+            else resolve(completed.result?.reply || 'No response');
+          } else {
+            pendingChatTasks.current[taskId] = { resolve, reject };
+          }
         } catch (err) {
           reject(err);
         }

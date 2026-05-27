@@ -1080,6 +1080,23 @@ fn next_reconnect_delay_secs(current: u64) -> u64 {
 }
 
 fn run_remote_task(task: RemoteTask) -> Result<serde_json::Value, String> {
+    if task.action == "chat" {
+        let payload = task.payload;
+        let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let history_val = payload.get("history").cloned().unwrap_or(serde_json::json!([]));
+        let history: Vec<OllamaMessage> = serde_json::from_value(history_val).unwrap_or_default();
+        let model = payload.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        let handle = tokio::runtime::Handle::current();
+        let reply = handle.block_on(async {
+            send_message_to_llm(message, history, model, Some("chat".to_string())).await
+        })?;
+
+        return Ok(serde_json::json!({
+            "reply": reply
+        }));
+    }
+
     if task.action != "run_agent" {
         return Err(format!("Unsupported task action: {}", task.action));
     }

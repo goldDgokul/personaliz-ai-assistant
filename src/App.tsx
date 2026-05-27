@@ -120,6 +120,8 @@ function App() {
   const [pendingContent, setPendingContent] = useState('');
   const [pendingAgentId, setPendingAgentId] = useState<string | null>(null);
 
+  const pendingChatTasks = useRef<Record<string, {resolve: (msg: string) => void, reject: (err: any) => void}>>({});
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const pushLogEntry = (entry: LogEntry) => {
     setLogs(prev => [entry, ...prev].slice(0, 200));
@@ -206,6 +208,17 @@ function App() {
         }
 
         if (event.type === 'task.done') {
+          const taskId = event.task_id || (event.task && event.task.id);
+          if (taskId && pendingChatTasks.current[taskId]) {
+            if (event.success === false) {
+              pendingChatTasks.current[taskId].reject(new Error(event.error || 'Remote chat failed'));
+            } else {
+              pendingChatTasks.current[taskId].resolve(event.result?.reply || 'No response');
+            }
+            delete pendingChatTasks.current[taskId];
+            return;
+          }
+
           const success = event.success !== false;
           setAgents(prev => prev.map(a => a.id === remoteAgentId ? { ...a, status: success ? 'completed' : 'idle' } : a));
           pushLogEntry({
@@ -344,6 +357,25 @@ function App() {
     const systemPrompt = `You are Personaliz, a helpful desktop assistant that helps users automate tasks with OpenClaw.
 You are friendly, conversational, and guide users step by step.
 Keep responses concise (2-3 sentences max).`;
+
+    if (!isTauriApp && remoteSocketConnected && userToken) {
+      return new Promise(async (resolve, reject) => {
+        try {
+          const taskId = await createBrokerTask(userToken, {
+            device_id: REMOTE_DEVICE_ID,
+            action: 'chat',
+            payload: {
+              message,
+              history: messages.map(m => ({ role: m.role, content: m.content })),
+              model
+            }
+          });
+          pendingChatTasks.current[taskId] = { resolve, reject };
+        } catch (err) {
+          reject(err);
+        }
+      });
+    }
 
     try {
       // Try Tauri command first (passes model name, logs usage to SQLite)

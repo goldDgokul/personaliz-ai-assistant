@@ -60,7 +60,7 @@ app = FastAPI(title="personaliz-broker")
 
 allowed_origins = [
     origin.strip()
-    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
     if origin.strip()
 ]
 app.add_middleware(

@@ -1213,18 +1213,19 @@ fn start_agent_connector() {
 
             reconnect_delay_secs = 1;
             println!("[broker] Connected as {}", device_id);
-            let _ = send_ws_json(
-                &mut ws,
-                serde_json::json!({"type":"agent.register","device_id":device_id}),
-            )
-            .await;
+            
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+            let _ = tx.send(serde_json::json!({"type":"agent.register","device_id":device_id}));
 
             let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
 
             loop {
                 tokio::select! {
                     _ = heartbeat.tick() => {
-                        if send_ws_json(&mut ws, serde_json::json!({"type":"heartbeat"})).await.is_err() {
+                        let _ = tx.send(serde_json::json!({"type":"heartbeat"}));
+                    }
+                    Some(msg_to_send) = rx.recv() => {
+                        if send_ws_json(&mut ws, msg_to_send).await.is_err() {
                             break;
                         }
                     }
@@ -1236,58 +1237,61 @@ fn start_agent_connector() {
                                     if envelope.message_type == "task.created" {
                                         if let Some(task) = envelope.task {
                                             let task_id = task.id.clone();
-                                            let _ = send_ws_json(&mut ws, serde_json::json!({
+                                            let _ = tx.send(serde_json::json!({
                                                 "type":"task.start",
                                                 "task_id": task_id,
-                                            })).await;
+                                            }));
 
                                             let action_name = task.action.clone();
-                                            let run = tokio::task::spawn_blocking(move || run_remote_task(task)).await;
-                                            match run {
-                                                Ok(Ok(result)) => {
-                                                    if let Some(logs) = result.get("result").and_then(|r| r.get("logs")).and_then(|l| l.as_array()) {
-                                                        for entry in logs {
-                                                            let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("info");
-                                                            let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("log");
-                                                            let _ = send_ws_json(&mut ws, serde_json::json!({
-                                                                "type":"task.log",
-                                                                "task_id": task_id,
-                                                                "level": level,
-                                                                "message": message,
-                                                            })).await;
+                                            let tx_clone = tx.clone();
+                                            tokio::spawn(async move {
+                                                let run = tokio::task::spawn_blocking(move || run_remote_task(task)).await;
+                                                match run {
+                                                    Ok(Ok(result)) => {
+                                                        if let Some(logs) = result.get("result").and_then(|r| r.get("logs")).and_then(|l| l.as_array()) {
+                                                            for entry in logs {
+                                                                let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+                                                                let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("log");
+                                                                let _ = tx_clone.send(serde_json::json!({
+                                                                    "type":"task.log",
+                                                                    "task_id": task_id,
+                                                                    "level": level,
+                                                                    "message": message,
+                                                                }));
+                                                            }
                                                         }
+                                                        let _ = tx_clone.send(serde_json::json!({
+                                                            "type":"task.log",
+                                                            "task_id": task_id,
+                                                            "level":"info",
+                                                            "message": format!("Completed action {}", action_name),
+                                                            "result": result.clone(),
+                                                        }));
+                                                        let _ = tx_clone.send(serde_json::json!({
+                                                            "type":"task.done",
+                                                            "task_id": task_id,
+                                                            "success": true,
+                                                            "result": result,
+                                                        }));
                                                     }
-                                                    let _ = send_ws_json(&mut ws, serde_json::json!({
-                                                        "type":"task.log",
-                                                        "task_id": task_id,
-                                                        "level":"info",
-                                                        "message": format!("Completed action {}", action_name),
-                                                        "result": result.clone(),
-                                                    })).await;
-                                                    let _ = send_ws_json(&mut ws, serde_json::json!({
-                                                        "type":"task.done",
-                                                        "task_id": task_id,
-                                                        "success": true,
-                                                        "result": result,
-                                                    })).await;
+                                                    Ok(Err(err)) => {
+                                                        let _ = tx_clone.send(serde_json::json!({
+                                                            "type":"task.done",
+                                                            "task_id": task_id,
+                                                            "success": false,
+                                                            "error": err,
+                                                        }));
+                                                    }
+                                                    Err(err) => {
+                                                        let _ = tx_clone.send(serde_json::json!({
+                                                            "type":"task.done",
+                                                            "task_id": task_id,
+                                                            "success": false,
+                                                            "error": format!("Task thread failed: {}", err),
+                                                        }));
+                                                    }
                                                 }
-                                                Ok(Err(err)) => {
-                                                    let _ = send_ws_json(&mut ws, serde_json::json!({
-                                                        "type":"task.done",
-                                                        "task_id": task_id,
-                                                        "success": false,
-                                                        "error": err,
-                                                    })).await;
-                                                }
-                                                Err(err) => {
-                                                    let _ = send_ws_json(&mut ws, serde_json::json!({
-                                                        "type":"task.done",
-                                                        "task_id": task_id,
-                                                        "success": false,
-                                                        "error": format!("Task thread failed: {}", err),
-                                                    })).await;
-                                                }
-                                            }
+                                            });
                                         }
                                     }
                                 }

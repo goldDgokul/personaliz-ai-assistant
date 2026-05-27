@@ -184,6 +184,23 @@ function App() {
 
         const task = event.task || {};
         const payload = task.payload || {};
+
+        if (event.type === 'task.done') {
+          const taskId = event.task_id || (event.task && event.task.id);
+          if (taskId) {
+            completedTasks.current[taskId] = event;
+            if (pendingChatTasks.current[taskId]) {
+              if (event.success === false) {
+                pendingChatTasks.current[taskId].reject(new Error(event.error || 'Remote chat failed'));
+              } else {
+                pendingChatTasks.current[taskId].resolve(event.result?.reply || 'No response');
+              }
+              delete pendingChatTasks.current[taskId];
+              return;
+            }
+          }
+        }
+
         const remoteAgentId = payload.agent?.id || event.result?.agent_id;
         if (!remoteAgentId) return;
 
@@ -209,19 +226,6 @@ function App() {
         }
 
         if (event.type === 'task.done') {
-          const taskId = event.task_id || (event.task && event.task.id);
-          if (taskId) {
-            completedTasks.current[taskId] = event;
-            if (pendingChatTasks.current[taskId]) {
-              if (event.success === false) {
-                pendingChatTasks.current[taskId].reject(new Error(event.error || 'Remote chat failed'));
-              } else {
-                pendingChatTasks.current[taskId].resolve(event.result?.reply || 'No response');
-              }
-              delete pendingChatTasks.current[taskId];
-              return;
-            }
-          }
 
           const success = event.success !== false;
           setAgents(prev => prev.map(a => a.id === remoteAgentId ? { ...a, status: success ? 'completed' : 'idle' } : a));

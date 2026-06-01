@@ -1,0 +1,595 @@
+Contents
+1. Introduction
+  1.1 Scope of the System
+  1.2 Existing System
+  1.3 Problems in Existing System
+  1.4 Features of Proposed System.
+  1.5 Benefits of Proposed System.
+2. Analysis
+  2.1 System Requirement Specification (SRS).
+  2.2 Resource Estimation and Cost Estimation
+  2.3 Operating Environment – Hardware and Software
+  2.4 Feasibility Study.
+3. System Design.
+  3.1 Architecture of a system
+  3.2 SDLC Model Used
+  3.3 Input Design.
+  3.4 Output Design.
+  3.5 DFD
+  3.6 E-R Diagram.
+  3.7 Data Base Tables.
+  3.8 Tools Description.
+4. System Implementation.
+  4.1 Functional module Description.
+5. Forms
+6. System Testing.
+  6.1 Testing Strategies.
+7. Major Enhancement of Present Project over the Existing System.
+8. Scope for Improvement.
+9. Conclusion.
+10. Future Enhancement.
+11. Bibliography.
+12. Appendix
+  Code
+
+1. Introduction
+Personaliz AI Assistant is a desktop automation assistant built with Tauri, React, and Rust, with Python automation support. The project provides a no-code conversational interface to create and run automation agents (especially LinkedIn-focused workflows), schedule them, review outputs, and maintain logs. The system is designed around local-first execution and combines local AI (Llama3 via Ollama) with optional external LLMs.
+
+The repository implementation shows a multi-layer architecture:
+- Desktop UI in TypeScript + React (`src/`)
+- Native/backend command layer in Rust (`src-tauri/src/main.rs`, `src-tauri/src/db.rs`, `src-tauri/src/scheduler.rs`)
+- Automation engine in Python (`public/agent_engine.py`)
+- Optional broker service for remote control in Python/FastAPI (`broker/main.py`)
+
+1.1 Scope of the System
+Scope includes:
+- Desktop onboarding for AI/automation setup (Ollama/llama.cpp/OpenClaw/API keys)
+- Chat-based assistant to guide setup and operations
+- Agent creation and management (name/role/goal/tools/schedule)
+- Scheduler support for hourly/daily/weekly/custom cron runs
+- LinkedIn automation (post generation + hashtag commenting)
+- Human-in-the-loop approval before production posting
+- Local SQLite persistence for agents, schedules, logs, run history, approvals, and OpenClaw runs
+- Integration with local LLM (Llama3) and optional cloud LLM providers
+
+Out of scope in current implementation:
+- Multi-user enterprise identity/access management
+- Distributed job queue with durable cloud database (broker is MVP/in-memory)
+- Advanced analytics dashboards
+
+1.2 Existing System
+Traditional automation systems usually require:
+- CLI-driven setup and JSON/YAML editing
+- Separate tools for scheduling, LLM calls, and browser automation
+- More technical skills for non-programmers
+
+Typical standalone existing approaches:
+- Manual social posting
+- Basic scripts without scheduler/audit trail
+- Generic cloud automation with less local privacy control
+
+1.3 Problems in Existing System
+Common issues in existing/manual approaches:
+- High setup complexity for non-technical users
+- No unified UI for creating, scheduling, and monitoring agent workflows
+- Weak local auditability of model usage and approvals
+- Limited human review workflow before publishing external content
+- Less privacy in cloud-only AI solutions
+
+1.4 Features of Proposed System.
+Implemented features from this repository:
+- Tauri desktop app with chat, agents, logs, settings tabs (`src/App.tsx`)
+- 5-step onboarding wizard (`src/components/Onboarding.tsx`)
+- 4-step agent creation modal with live cron validation (`src/components/AgentCreationModal.tsx`)
+- Approval modal and approval audit logging (`src/components/ApprovalModal.tsx`, `db_record_approval`)
+- Local AI support using Ollama and llama.cpp endpoint checks
+- External LLM routing (OpenAI/Anthropic/Google) in Rust command layer (`send_message_to_external_llm`)
+- Python Playwright automation for LinkedIn posting/commenting (`public/agent_engine.py`)
+- SQLite persistence and scheduler orchestration (`src-tauri/src/db.rs`, `src-tauri/src/scheduler.rs`)
+- Optional remote broker MVP via FastAPI + WebSocket (`broker/main.py`)
+
+1.5 Benefits of Proposed System.
+- Local-first privacy: keys and operational state are stored locally
+- Better usability: non-technical users can operate through guided UI and chat
+- Reliability: scheduler + logs + run history + approvals create operational traceability
+- Flexibility: supports both local LLM (Llama3/Ollama) and cloud LLMs
+- Safety: sandbox mode and approval flow reduce accidental production actions
+
+2. Analysis
+2.1 System Requirement Specification (SRS).
+Functional requirements:
+- FR1: User can complete onboarding for local LLM/OpenClaw/API keys
+- FR2: User can create/edit/delete agents with schedule and tools
+- FR3: System validates custom cron expressions and computes next run
+- FR4: System can execute automation via Python engine and OpenClaw CLI
+- FR5: User can approve/reject generated content before production posting
+- FR6: System stores agent metadata, logs, run history, LLM usage, approvals, OpenClaw run outputs
+- FR7: User can query logs, run history, and approvals in the UI
+- FR8: System can send chat prompts to local or external LLM
+
+Non-functional requirements:
+- NFR1: Desktop responsiveness for agent operations and log viewing
+- NFR2: Local data persistence in SQLite for offline continuity
+- NFR3: Security through local key handling + explicit approval flow
+- NFR4: Maintainability via modular frontend/backend/automation separation
+- NFR5: Cross-platform target through Tauri stack
+
+2.2 Resource Estimation and Cost Estimation
+Development resources:
+- Frontend developer skills: React + TypeScript + CSS
+- Backend/native integration skills: Rust + Tauri
+- Automation scripting skills: Python + Playwright
+- Optional broker deployment skills: FastAPI/WebSockets
+
+Runtime resource estimate (single-user desktop):
+- CPU: modern 4-core or better
+- RAM: 8 GB minimum (16 GB recommended for local Llama3)
+- Disk: model storage for Ollama (Llama3 can require multiple GB) + app data/logs
+- Network: required for LinkedIn automation and cloud LLM APIs
+
+Cost estimate (project/student use):
+- Local execution cost: low (desktop compute + electricity)
+- Cloud LLM API cost: variable by usage/model if external APIs are enabled
+- Broker hosting (optional): low-tier cloud service for MVP
+
+2.3 Operating Environment – Hardware and Software
+Languages used in this project:
+- TypeScript (frontend logic)
+- Python (automation engine + broker service)
+- Rust (Tauri backend + scheduler + DB layer)
+- CSS (UI styling)
+- HTML (app entry and rendered UI structure)
+
+Software stack:
+- Node.js + npm
+- Vite + React
+- Tauri 2.x + Rust toolchain
+- SQLite via `rusqlite`
+- Python 3.9+
+- Playwright + Chromium
+- Ollama/llama.cpp (for local AI)
+
+Build/run instructions (derived from repo scripts/README):
+- Install dependencies: `npm install`
+- Frontend dev server: `npm run dev`
+- Tauri desktop dev: `npm run tauri-dev` (or `npm run tauri dev`)
+- Frontend production build: `npm run build`
+- Desktop packaging build: `npm run tauri-build` (or `npm run tauri build`)
+- TypeScript check: `npx tsc --noEmit`
+- Rust checks/tests: `cd src-tauri && cargo check && cargo test`
+
+2.4 Feasibility Study.
+Technical feasibility: High
+- Proven stack with working modules and integrated command handlers
+- Scheduler and SQLite are already implemented
+
+Operational feasibility: High
+- Guided onboarding and chat reduce training burden
+- Sandbox mode supports safer demonstrations
+
+Economic feasibility: Medium to High
+- Low initial software licensing cost (open-source ecosystem)
+- External model usage can increase variable cost if enabled
+
+Schedule feasibility: High (for final-year scope)
+- Core implementation is complete with runnable modules and documented commands
+
+3. System Design.
+3.1 Architecture of a system
+The system uses a layered desktop architecture:
+
+Component Architecture Diagram (ASCII)
+
+[User]
+  |
+  v
+[React + TypeScript UI (src/App.tsx, components/*)]
+  |  invoke() via Tauri bridge
+  v
+[Rust Tauri Command Layer (src-tauri/src/main.rs)]
+  |\
+  | \---> [SQLite Layer (src-tauri/src/db.rs)] ---> data.db (local file)
+  | \
+  |  \--> [Scheduler (src-tauri/src/scheduler.rs)]
+  |   \
+  |    \-> [Python Agent Engine (public/agent_engine.py)] ---> [Playwright/LinkedIn]
+  |
+  \-----> [LLM Integrations]
+           |- Local: Ollama / llama.cpp
+           \- External: OpenAI / Anthropic / Google APIs
+
+Optional remote control path:
+[Desktop App] <WebSocket> [Broker FastAPI Service (broker/main.py)] <WebSocket> [Client UI]
+
+Sequence Diagram 1: Chat to LLM
+User -> UI: Enter message
+UI -> Rust command: send_message_to_llm / send_message_to_external_llm
+Rust -> LLM endpoint: HTTP request (local/cloud)
+LLM endpoint -> Rust: generated text
+Rust -> SQLite: log model usage (llm_usage)
+Rust -> UI: response
+UI -> User: render assistant reply
+
+Sequence Diagram 2: Scheduled Agent Execution
+Scheduler loop -> SQLite: read enabled schedules
+Scheduler -> Scheduler: compare now vs next_run
+Scheduler -> Python engine: execute due agent
+Python engine -> LinkedIn/automation target: perform/simulate actions
+Python engine -> Scheduler: JSON result
+Scheduler -> SQLite: update run_history/logs/schedule next_run
+UI -> SQLite: fetch logs/history for display
+
+3.2 SDLC Model Used
+Recommended model reflected by repository evolution: Iterative/Incremental SDLC.
+- Iteration 1: Core desktop shell and chat
+- Iteration 2: Agent CRUD + scheduling + DB persistence
+- Iteration 3: LinkedIn automation + approval workflow
+- Iteration 4: External provider integrations + broker MVP
+
+Why suitable:
+- Feature-wise modularity allows staged delivery
+- Supports frequent validation in an integration-heavy project
+
+3.3 Input Design.
+Major input channels:
+- Chat input box (commands and natural language requests)
+- Onboarding forms (backend selection, model selection, API keys)
+- Agent creation form (name, role, goal, tools, schedule, cron expression)
+- Settings toggles (sandbox mode, provider/model selection)
+- Approval modal text edits (pre-publication content review)
+
+Validation design:
+- Required field checks for agent creation
+- Cron expression validation through backend command (`validate_cron_expression`)
+- Local dependency status checks (`check_node_available`, `check_python_available`, etc.)
+
+3.4 Output Design.
+Output artifacts include:
+- LLM chat responses
+- Structured logs with status levels
+- Run history records (started/finished/status/result)
+- Approval audit records (approved/rejected/cancelled)
+- OpenClaw run output (stdout/stderr + exit code)
+- Trending topics and LinkedIn automation result JSON from Python engine
+
+UI outputs:
+- Real-time statuses, success/error indicators
+- Logs tab for operational traceability
+- Schedule next-run previews
+
+3.5 DFD
+DFD – Context Level (Level 0)
+
+[User] <--> (Personaliz AI Assistant System) <--> [Local LLM / External LLM APIs]
+[User] <--> (Personaliz AI Assistant System) <--> [LinkedIn via Playwright]
+[User] <--> (Personaliz AI Assistant System) <--> [SQLite data.db]
+[Optional Remote Client] <--> (System via Broker) <--> [Desktop Agent]
+
+DFD – Level 1
+
+P1: UI & Interaction Management
+  Inputs: user chat/forms/settings
+  Outputs: invoke requests, rendered responses
+
+P2: LLM Orchestration
+  Inputs: message/history/model/provider
+  Outputs: generated response, llm_usage records
+
+P3: Agent Management & Scheduling
+  Inputs: agent definitions, schedule rules
+  Outputs: run triggers, next_run updates, run status
+
+P4: Automation Execution Engine
+  Inputs: agent commands/content/sandbox flag
+  Outputs: action results, execution logs
+
+P5: Persistence & Audit
+  Inputs: events from all processes
+  Outputs: stored agents/schedules/logs/history/approvals/openclaw_runs
+
+Data stores:
+- D1: SQLite `data.db`
+- D2: Local browser profile and app state files
+
+3.6 E-R Diagram.
+Since the project uses SQLite, ER modeling is directly applicable.
+
+ER Diagram (conceptual text)
+
+[AGENTS] 1 ----- N [SCHEDULES]
+[AGENTS] 1 ----- N [LOGS]
+[AGENTS] 1 ----- N [RUN_HISTORY]
+[AGENTS] 1 ----- N [APPROVALS]
+[AGENTS] 1 ----- N [OPENCLAW_RUNS]
+[LLM_USAGE] is independent event log (not strictly FK-bound to AGENTS)
+
+Entity notes:
+- AGENTS is the core entity (id as primary key)
+- SCHEDULES references AGENTS via `agent_id` (with cascade delete)
+- Operational/audit entities capture lifecycle and governance data
+
+3.7 Data Base Tables.
+Database file location:
+- Linux/macOS: `~/.local/share/personaliz-assistant/data.db`
+- Windows: `%APPDATA%/personaliz-assistant/data.db`
+
+Tables from `src-tauri/src/db.rs` schema:
+1) agents
+- id (PK, TEXT)
+- name (TEXT)
+- role (TEXT)
+- goal (TEXT)
+- tools (TEXT)
+- status (TEXT)
+- created_at (TEXT)
+
+2) schedules
+- id (PK, TEXT)
+- agent_id (FK -> agents.id)
+- frequency (TEXT)
+- cron_expression (TEXT, nullable)
+- enabled (INTEGER)
+- last_run (TEXT, nullable)
+- next_run (TEXT)
+- created_at (TEXT)
+
+3) logs
+- id (PK, INTEGER AUTOINCREMENT)
+- agent_id (TEXT)
+- level (TEXT)
+- message (TEXT)
+- timestamp (TEXT)
+
+4) run_history
+- id (PK, INTEGER AUTOINCREMENT)
+- agent_id (TEXT)
+- started_at (TEXT)
+- finished_at (TEXT, nullable)
+- status (TEXT)
+- result (TEXT, nullable)
+
+5) llm_usage
+- id (PK, INTEGER AUTOINCREMENT)
+- provider (TEXT)
+- model (TEXT)
+- context (TEXT)
+- timestamp (TEXT)
+
+6) approvals
+- id (PK, INTEGER AUTOINCREMENT)
+- agent_id (TEXT)
+- content_preview (TEXT)
+- outcome (TEXT)
+- decided_at (TEXT)
+- notes (TEXT, nullable)
+
+7) openclaw_runs
+- id (PK, INTEGER AUTOINCREMENT)
+- agent_id (TEXT)
+- config_path (TEXT)
+- command (TEXT)
+- stdout (TEXT)
+- stderr (TEXT)
+- exit_code (INTEGER, nullable)
+- started_at (TEXT)
+- finished_at (TEXT, nullable)
+
+3.8 Tools Description.
+Core tools/frameworks and their use:
+- Tauri: desktop shell and secure command bridge
+- React + TypeScript: user interface and state management
+- Rust: command handlers, scheduler, and persistence logic
+- SQLite (`rusqlite`): local durable storage
+- Python: browser automation and content workflow engine
+- Playwright: LinkedIn browser automation
+- Ollama/llama.cpp: local model serving (Llama3 and compatible models)
+- Reqwest/fetch: HTTP communications with external APIs
+- FastAPI + WebSocket: optional broker for remote task control
+- CSS: custom styling for onboarding/forms/modals/dashboard
+
+4. System Implementation.
+4.1 Functional module Description.
+Module A: Desktop UI and Interaction
+- Main file: `src/App.tsx`
+- Handles tabs, chat flow, agent list, logs/history rendering, settings, and command dispatch.
+
+Module B: Onboarding and Setup
+- `src/components/Onboarding.tsx`
+- Multi-step setup for local model backend, OpenClaw install checks, API key capture.
+
+Module C: Agent Configuration and Approval
+- `src/components/AgentCreationModal.tsx`
+- `src/components/ApprovalModal.tsx`
+- Creates agent metadata and validates cron; enforces review step for production posting workflows.
+
+Module D: Native Command/API Layer
+- `src-tauri/src/main.rs`
+- Exposes Tauri commands for LLM messaging, dependency checks, DB CRUD, scheduling, and automation execution.
+
+Module E: Scheduler and Cron Engine
+- `src-tauri/src/scheduler.rs`
+- Polls schedules, computes due jobs, parses cron expression, triggers execution, and records outcomes.
+
+Module F: Persistence Layer
+- `src-tauri/src/db.rs`
+- Initializes schema, performs DB operations for all app entities, supports log and audit retrieval.
+
+Module G: Python Automation Engine
+- `public/agent_engine.py`
+- Provides CLI/subcommands for LinkedIn posting/commenting/trending topics.
+- Includes local Ollama generation path (`llama3:8b` default), post validation/cleanup, and sandbox behavior.
+
+Module H: Optional Remote Broker
+- `broker/main.py`
+- FastAPI endpoints + WebSocket channels for task dispatch and device status updates.
+
+5. Forms
+Implemented forms/screens in current system:
+1) Onboarding Form (5-step)
+- Welcome, local LLM setup, OpenClaw setup, API keys, completion
+- Fields: backend, model, keys, install/action buttons
+
+2) Agent Creation Form (4-step modal)
+- Agent name, role, goal, tools, schedule/cron
+- Includes review section and cron next-run preview
+
+3) Approval Form (modal)
+- Editable generated content
+- Actions: Approve & Execute / Discard
+- Writes approval audit log
+
+4) Settings Inputs
+- Sandbox mode toggle, provider/model/key settings in UI context
+
+5) Chat Input Form
+- Free-text command and conversational input for assistant-driven operations
+
+6. System Testing.
+Testing observed from repository and execution:
+- Frontend build pipeline available via Vite
+- TypeScript compile/type-check command
+- Rust check and Rust unit tests (notably scheduler cron tests)
+- Manual runtime workflow testing supported through `npm run tauri-dev`
+
+Executed validation in this environment:
+- `npm install` ✅
+- `npm run build` ✅
+- `npx tsc --noEmit` ✅
+- `cargo check` ❌ (sandbox missing `glib-2.0`/`gobject-2.0` system libraries)
+- `cargo test` ❌ (same environment dependency issue)
+
+6.1 Testing Strategies.
+Recommended strategy for this project:
+1) Unit Testing
+- Rust scheduler/cron parser tests in `src-tauri/src/scheduler.rs`
+- Expand with more edge-case tests for cron expressions and next-run computation
+
+2) Integration Testing
+- Validate Tauri invoke flow: UI -> Rust command -> DB update/result return
+- Validate Python engine invocation and JSON output handling
+
+3) End-to-End Testing (manual/automated)
+- Onboarding completion
+- Agent creation with cron
+- Sandbox execution and log verification
+- Approval-required production execution path
+
+4) Regression Testing
+- Re-run build/type-check after feature updates
+- Re-run Rust tests in environment with required native libs
+
+7. Major Enhancement of Present Project over the Existing System.
+Major enhancements provided by this project:
+- Unified desktop platform replacing fragmented scripts/tools
+- Local AI-first capability (Llama3 via Ollama) with optional external provider fallback
+- Human-in-the-loop approval and auditable approval records
+- Built-in scheduler with cron support and next-run preview
+- Persistent operational logging, run history, and LLM usage audit in SQLite
+- Optional remote control channel with WebSocket broker MVP
+
+8. Scope for Improvement.
+- Add role-based authentication and encryption-at-rest for local sensitive settings
+- Replace in-memory broker state with persistent DB-backed queue
+- Add richer analytics dashboard (agent success rate, latency, token/cost tracking)
+- Improve automated testing coverage for frontend components and Tauri command integration
+- Add plugin architecture for more automation targets beyond LinkedIn
+- Add retry/backoff policy configuration UI for failed runs
+
+9. Conclusion.
+The Personaliz AI Assistant repository demonstrates a complete final-year project implementation for desktop AI-powered automation. It successfully integrates a TypeScript frontend, Rust-native Tauri backend, Python automation workflows, and local SQLite persistence. The system addresses practical challenges of usability, local privacy, and operational governance through onboarding, scheduling, sandboxing, and approval/audit features.
+
+10. Future Enhancement.
+- Multi-device synchronization and secure cloud backup
+- Model performance benchmarking and automatic model selection
+- Advanced prompt/workflow templates for domain-specific automations
+- Expanded social and enterprise integrations (email/CRM/docs)
+- Enhanced offline-first capabilities and packaged dependency bootstrapper
+- Policy engine for content moderation and compliance rules
+
+11. Bibliography.
+1) Repository documentation and source code:
+   - `README.md`
+   - `src/App.tsx`
+   - `src/components/Onboarding.tsx`
+   - `src/components/AgentCreationModal.tsx`
+   - `src/components/ApprovalModal.tsx`
+   - `src-tauri/src/main.rs`
+   - `src-tauri/src/db.rs`
+   - `src-tauri/src/scheduler.rs`
+   - `public/agent_engine.py`
+   - `broker/main.py`
+2) Official technology references:
+   - Tauri documentation: https://tauri.app
+   - React documentation: https://react.dev
+   - Rust documentation: https://www.rust-lang.org
+   - Playwright Python docs: https://playwright.dev/python
+   - Ollama docs: https://ollama.com
+   - FastAPI docs: https://fastapi.tiangolo.com
+
+12. Appendix
+Code
+(As requested, no source code is pasted. Below is the folder/file list and purpose summary.)
+
+A) Root-level project files
+- `README.md` — project overview, architecture, usage, and commands
+- `package.json` — frontend/Tauri npm scripts and JS dependencies
+- `package-lock.json` — exact npm dependency lockfile
+- `tsconfig.json`, `tsconfig.node.json` — TypeScript configuration
+- `vite.config.ts` — Vite build/dev configuration
+- `index.html` — frontend HTML entry
+- `.gitignore`, `LICENSE`, `vercel.json` — repository meta/config files
+
+B) Frontend (TypeScript/React/CSS)
+Folder: `src/`
+- `main.tsx` — React app bootstrap
+- `App.tsx` — primary application logic and UI orchestration
+- `App.css` — core UI styles
+- `vite-env.d.ts` — Vite TS typings
+- `assets/react.svg` — UI asset
+
+Folder: `src/components/`
+- `Onboarding.tsx` — setup wizard for local LLM/OpenClaw/API keys
+- `AgentCreationModal.tsx` — multi-step agent form and cron validation
+- `ApprovalModal.tsx` — approval/review workflow modal
+- `refinements.css` — additional component styling refinements
+
+Folder: `src/services/`
+- `ollamaService.ts` — local Ollama chat helper service
+- `openClawService.ts` — OpenClaw helper service layer
+- `brokerTransport.ts` — broker HTTP/WebSocket communication helpers
+
+Folder: `src/styles/`
+- `Onboarding.css` — onboarding-specific styling
+- `AgentCreationModal.css` — modal-specific styling
+
+C) Tauri + Rust backend
+Folder: `src-tauri/src/`
+- `main.rs` — Tauri command handlers and app startup wiring
+- `db.rs` — SQLite schema + CRUD operations
+- `scheduler.rs` — schedule loop and cron parsing logic
+- `lib.rs` — crate module entry
+
+Folder: `src-tauri/`
+- `Cargo.toml`, `Cargo.lock` — Rust dependencies/build definitions
+- `build.rs` — Tauri build script
+- `tauri.conf.json` — Tauri app config
+- `hashtag_agent.py`, `openclaw_logic.py` — auxiliary automation scripts
+- `icons/*` — desktop app icons and packaging assets
+- `.gitignore` — Rust/Tauri ignore settings
+
+D) Python automation engine
+Folder: `public/`
+- `agent_engine.py` — main automation CLI for LinkedIn tasks/trending topics
+- `openclaw_logic.py` — OpenClaw-related helper logic
+- `tauri.svg`, `vite.svg` — static assets
+
+E) Optional remote broker service
+Folder: `broker/`
+- `main.py` — FastAPI broker app with task/device/ws channels
+- `requirements.txt` — Python dependencies for broker service
+- `render.yaml` — deployment configuration
+- `README.md` — broker usage notes
+
+F) Additional repository artifacts
+- `projectCode` — bundled large project artifact file present in repo root
+- `npm`, `set` — empty files present in current repository root snapshot
